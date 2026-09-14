@@ -37,7 +37,7 @@ static lv_obj_t* s_filesEmpty = nullptr;   // "no scripts yet" placeholder
 // ---- Settings-tab switch handles (indexed by SETTING_*) -------------------
 enum SettingIdx {
     SET_WIFI = 0, SET_BT, SET_BTDISC, SET_LED,
-    SET_SILENT, SET_LOGGING, SET_COM,
+    SET_SILENT, SET_LOGGING, SET_COM, SET_AUTOSTART,
     SET_COUNT
 };
 static lv_obj_t* s_settingSw[SET_COUNT] = { nullptr };
@@ -54,6 +54,8 @@ static unsigned long s_lastBattPoll   = 0;
 static unsigned long s_lastPMUProbe   = 0;
 static WatchUiPendingSettings s_pending = {};
 static WatchUiPendingScriptAction s_pendingAction = {};
+static WatchUiPendingExtras s_pendingExtras = {};
+static String s_currentAutostart;   // "" = none; used for star highlight
 static uint32_t s_bannerUntil = 0;
 
 // Clock overlay + power-hold + screen-sleep state
@@ -225,17 +227,21 @@ static void settingSwitchCb(lv_event_t* e) {
     int idx        = (int)(intptr_t)lv_event_get_user_data(e);
     bool on        = lv_obj_has_state(sw, LV_STATE_CHECKED);
     switch (idx) {
-        case SET_WIFI:    s_pending.has_wifi    = true; s_pending.wifi_on    = on; break;
-        case SET_BT:      s_pending.has_bt      = true; s_pending.bt_on      = on; break;
-        case SET_BTDISC:  s_pending.has_btdisc  = true; s_pending.btdisc_on  = on; break;
-        case SET_LED:     s_pending.has_led     = true; s_pending.led_on     = on; break;
-        case SET_SILENT:  s_pending.has_silent  = true; s_pending.silent_on  = on; break;
-        case SET_LOGGING: s_pending.has_logging = true; s_pending.logging_on = on; break;
-        case SET_COM:     s_pending.has_com     = true; s_pending.com_on     = on; break;
+        case SET_WIFI:      s_pending.has_wifi    = true; s_pending.wifi_on    = on; break;
+        case SET_BT:        s_pending.has_bt      = true; s_pending.bt_on      = on; break;
+        case SET_BTDISC:    s_pending.has_btdisc  = true; s_pending.btdisc_on  = on; break;
+        case SET_LED:       s_pending.has_led     = true; s_pending.led_on     = on; break;
+        case SET_SILENT:    s_pending.has_silent  = true; s_pending.silent_on  = on; break;
+        case SET_LOGGING:   s_pending.has_logging = true; s_pending.logging_on = on; break;
+        case SET_COM:       s_pending.has_com     = true; s_pending.com_on     = on; break;
+        case SET_AUTOSTART: s_pendingExtras.has_autostart = true;
+                            s_pendingExtras.autostart_on  = on; break;
     }
 }
 static void rebootBtnCb(lv_event_t*)         { s_pending.want_reboot        = true; }
 static void factoryResetBtnCb(lv_event_t*)   { s_pending.want_factory_reset = true; }
+static void resetStdBtnCb(lv_event_t*)       { s_pendingExtras.want_reset_std = true; }
+static void brickBtnCb(lv_event_t*)          { s_pendingExtras.want_brick     = true; }
 
 // ---- tab builders ---------------------------------------------------------
 static void buildHomeTab(lv_obj_t* tab) {
@@ -314,21 +320,9 @@ static void buildHomeTab(lv_obj_t* tab) {
     lv_obj_set_style_text_font(s_clientsLbl, &lv_font_montserrat_16, 0);
     lv_obj_align(s_clientsLbl, LV_ALIGN_TOP_LEFT, 0, 80);
 
-    // Banner overlay sits between the AP card and the STOP button. Used for
-    // transient system events (SD inserted/removed, power-off countdown).
-    s_bannerLbl = lv_label_create(tab);
-    lv_obj_set_style_text_color(s_bannerLbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(s_bannerLbl, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_bg_color(s_bannerLbl, lvhex(C_LINE), 0);
-    lv_obj_set_style_bg_opa(s_bannerLbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(s_bannerLbl, 10, 0);
-    lv_obj_set_style_radius(s_bannerLbl, 8, 0);
-    lv_obj_set_width(s_bannerLbl, LCD_W - 40);
-    lv_obj_set_style_text_align(s_bannerLbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_bannerLbl, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_bannerLbl, "");
-    lv_obj_align(s_bannerLbl, LV_ALIGN_BOTTOM_MID, 0, -170);
-    lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+    // Banner moved out of buildHomeTab — it now lives on lv_layer_top()
+    // (created in watchUiBegin) so the power-off countdown / SD hot-plug
+    // toast floats above Home, Files, Settings and the clock overlay.
 
     // Toast overlay (hidden until watchUiFlash). Bug #22: sit ABOVE the STOP
     // button (74 tall, bottom -10) with generous space above so the toast
@@ -378,6 +372,20 @@ static void filesDelCb(lv_event_t* e) {
     s_pendingAction.has_delete = true;
     strncpy(s_pendingAction.delete_name, name, sizeof(s_pendingAction.delete_name) - 1);
     s_pendingAction.delete_name[sizeof(s_pendingAction.delete_name) - 1] = '\0';
+}
+static void filesStarCb(lv_event_t* e) {
+    const char* name = (const char*)lv_event_get_user_data(e);
+    if (!name) return;
+    s_pendingAction.has_toggle_autostart = true;
+    // Pressing the star on the currently-armed script clears autostart;
+    // pressing on any other row makes THAT the new autostart target.
+    if (s_currentAutostart == String(name)) {
+        s_pendingAction.autostart_name[0] = '\0';
+    } else {
+        strncpy(s_pendingAction.autostart_name, name,
+                sizeof(s_pendingAction.autostart_name) - 1);
+        s_pendingAction.autostart_name[sizeof(s_pendingAction.autostart_name) - 1] = '\0';
+    }
 }
 
 static void buildFilesTab(lv_obj_t* tab) {
@@ -450,10 +458,15 @@ static void buildSettingsTab(lv_obj_t* tab) {
     makeSwitchRow(tab, LV_SYMBOL_EYE_CLOSE, "Silent startup",  false, settingSwitchCb, SET_SILENT);
     makeSwitchRow(tab, LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
     makeSwitchRow(tab, LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
+    // Autostart: gates whether the persisted boot_script runs at boot.
+    // Independent from Files-tab star, which sets *which* script is queued.
+    makeSwitchRow(tab, LV_SYMBOL_PLAY,       "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
 
     // Section: Actions
-    makeActionRow(tab, LV_SYMBOL_REFRESH, "Reboot",        "REBOOT",  false, rebootBtnCb);
-    makeActionRow(tab, LV_SYMBOL_TRASH,   "Factory reset", "WIPE",    true,  factoryResetBtnCb);
+    makeActionRow(tab, LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
+    makeActionRow(tab, LV_SYMBOL_LOOP,    "Reset to standard", "RESET",  false, resetStdBtnCb);
+    makeActionRow(tab, LV_SYMBOL_TRASH,   "Factory reset",     "WIPE",   true,  factoryResetBtnCb);
+    makeActionRow(tab, LV_SYMBOL_WARNING, "Brick firmware",    "BRICK",  true,  brickBtnCb);
 
     // Footer version stamp
     lv_obj_t* v = lv_label_create(tab);
@@ -547,6 +560,34 @@ void watchUiBegin() {
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
+    // Banner on lv_layer_top() — floats above every tab and the clock. See
+    // watchUiSetBanner() which move-foregrounds it on each show so the
+    // clock overlay never occludes the countdown / hot-plug toast.
+    s_bannerLbl = lv_label_create(lv_layer_top());
+    lv_obj_set_style_text_color(s_bannerLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_bannerLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_letter_space(s_bannerLbl, 0, 0);
+    lv_obj_set_style_bg_color(s_bannerLbl, lvhex(C_LINE), 0);
+    lv_obj_set_style_bg_opa(s_bannerLbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_bannerLbl, 10, 0);
+    lv_obj_set_style_radius(s_bannerLbl, 8, 0);
+    lv_obj_set_width(s_bannerLbl, LCD_W - 40);
+    lv_obj_set_style_text_align(s_bannerLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_bannerLbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_bannerLbl, "");
+    lv_obj_align(s_bannerLbl, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+
+    // Swipe-UP anywhere on the screen brings the clock back. The tabview's
+    // own gesture handler is one place; attaching a screen-level fallback
+    // too catches gestures inside scrollable tab-content that would
+    // otherwise be consumed by the scroll.
+    lv_obj_add_event_cb(lv_scr_act(), [](lv_event_t* e){
+        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+        lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+        if (d == LV_DIR_TOP && !watchUiClockVisible()) watchUiShowClock();
+    }, LV_EVENT_GESTURE, nullptr);
+
     // Clock face — shown at boot; swipe down to reveal the tabview.
     watchUiShowClock();
 
@@ -585,13 +626,15 @@ void watchUiShowClock() {
     lv_label_set_text(s_clockTime, "00:00");
     lv_obj_set_style_text_color(s_clockTime, lv_color_white(), 0);
     lv_obj_set_style_text_font(s_clockTime, &lv_font_montserrat_48, 0);
-    lv_obj_align(s_clockTime, LV_ALIGN_CENTER, 0, -10);
-
-    s_clockHint = lv_label_create(s_clockRoot);
-    lv_label_set_text(s_clockHint, LV_SYMBOL_DOWN "  swipe down to reveal");
-    lv_obj_set_style_text_color(s_clockHint, lvhex(C_MUTED), 0);
-    lv_obj_set_style_text_font(s_clockHint, &lv_font_montserrat_16, 0);
-    lv_obj_align(s_clockHint, LV_ALIGN_BOTTOM_MID, 0, -40);
+    // Pin transform + letter spacing on the clock label itself so it can't
+    // inherit any theme-applied stretch. Same discipline as the tab-button
+    // fix — belt and braces.
+    lv_obj_set_style_transform_scale_x(s_clockTime, 256, 0);
+    lv_obj_set_style_transform_scale_y(s_clockTime, 256, 0);
+    lv_obj_set_style_text_letter_space(s_clockTime, 0, 0);
+    lv_obj_center(s_clockTime);
+    // Hint text removed per user request — clock face stays clean.
+    s_clockHint = nullptr;
 }
 
 void watchUiHideClock() {
@@ -672,8 +715,12 @@ void watchUiTick() {
     // gives touch/server/USB more headroom. The old forced full-screen
     // invalidate every 300 ms is gone — it caused a repaint storm and was
     // only added as a diagnostic that never proved anything.
+    // Watch port perf: rate-limit lv_task_handler to 5 ms so touch tracking
+    // stays sharp — LVGL's own scheduler still respects LV_DEF_REFR_PERIOD.
+    // The pass early-outs cheaply when nothing is dirty (~50 µs), so 5 ms
+    // is nearly free compared to the old 10 ms cap.
     static unsigned long s_lastHandler = 0;
-    if (now - s_lastHandler < 10) return;
+    if (now - s_lastHandler < 5) return;
     s_lastHandler = now;
     lv_task_handler();
 
@@ -870,12 +917,18 @@ void watchUiSetBanner(const char* text, uint32_t rgb) {
     lv_label_set_text(s_bannerLbl, text);
     lv_obj_set_style_bg_color(s_bannerLbl, lvhex(rgb), 0);
     lv_obj_clear_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+    // Banner and clock both live on lv_layer_top(). Force the banner to the
+    // top of the sibling order so the power-off countdown stays visible
+    // even while the clock overlay is up.
+    lv_obj_move_foreground(s_bannerLbl);
     // 4-second banner; call watchUiSetBanner(nullptr) to clear early.
     s_bannerUntil = millis() + 4000;
 }
 
-void watchUiSetFileList(const std::vector<String>& names) {
+void watchUiSetFileList(const std::vector<String>& names,
+                        const String& autostartName) {
     if (!s_filesList || !s_filesEmpty) return;
+    s_currentAutostart = autostartName;
     // Wipe existing rows. LVGL frees the child widgets; the user_data we set
     // on each button points at std::string entries in s_fileRowNames, so we
     // clear the LVGL tree BEFORE mutating the vector so no callback fires
@@ -897,7 +950,7 @@ void watchUiSetFileList(const std::vector<String>& names) {
         lv_obj_t* row = lv_obj_create(s_filesList);
         lv_obj_remove_style_all(row);
         lv_obj_set_size(row, LCD_W, 68);
-        lv_obj_set_style_pad_hor(row, 12, 0);
+        lv_obj_set_style_pad_hor(row, 8, 0);
         lv_obj_set_style_pad_ver(row, 8, 0);
         lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
         lv_obj_set_style_border_width(row, 1, 0);
@@ -917,12 +970,33 @@ void watchUiSetFileList(const std::vector<String>& names) {
         lv_obj_set_flex_grow(lbl, 1);
         lv_obj_set_style_pad_right(lbl, 8, 0);
 
+        bool isAutostart = (autostartName.length() > 0 &&
+                            autostartName == n);
+
+        // ⏱ Autostart — filled yellow when set, muted grey when not.
+        lv_obj_t* starBtn = lv_btn_create(row);
+        lv_obj_set_size(starBtn, 52, 52);
+        lv_obj_set_style_bg_color(starBtn,
+            lvhex(isAutostart ? 0xE5A93A : 0x2A2A30), 0);
+        lv_obj_set_style_radius(starBtn, 8, 0);
+        lv_obj_set_style_shadow_width(starBtn, 0, 0);
+        lv_obj_add_event_cb(starBtn, filesStarCb, LV_EVENT_CLICKED, (void*)nameCstr);
+        lv_obj_t* starLbl = lv_label_create(starBtn);
+        // No star glyph in the built-in montserrat FA subset; use upload
+        // arrow ("pin") with a bright-vs-dim colour tell.
+        lv_label_set_text(starLbl, LV_SYMBOL_UPLOAD);
+        lv_obj_set_style_text_color(starLbl,
+            isAutostart ? lv_color_white() : lvhex(C_MUTED), 0);
+        lv_obj_set_style_text_font(starLbl, &lv_font_montserrat_22, 0);
+        lv_obj_center(starLbl);
+
         // ▶ Run — green square
         lv_obj_t* runBtn = lv_btn_create(row);
         lv_obj_set_size(runBtn, 52, 52);
         lv_obj_set_style_bg_color(runBtn, lvhex(C_OK), 0);
         lv_obj_set_style_radius(runBtn, 8, 0);
         lv_obj_set_style_shadow_width(runBtn, 0, 0);
+        lv_obj_set_style_margin_left(runBtn, 6, 0);
         lv_obj_add_event_cb(runBtn, filesRunCb, LV_EVENT_CLICKED, (void*)nameCstr);
         lv_obj_t* runLbl = lv_label_create(runBtn);
         lv_label_set_text(runLbl, LV_SYMBOL_PLAY);
@@ -936,7 +1010,7 @@ void watchUiSetFileList(const std::vector<String>& names) {
         lv_obj_set_style_bg_color(delBtn, lvhex(C_DANGER), 0);
         lv_obj_set_style_radius(delBtn, 8, 0);
         lv_obj_set_style_shadow_width(delBtn, 0, 0);
-        lv_obj_set_style_margin_left(delBtn, 8, 0);
+        lv_obj_set_style_margin_left(delBtn, 6, 0);
         lv_obj_add_event_cb(delBtn, filesDelCb, LV_EVENT_CLICKED, (void*)nameCstr);
         lv_obj_t* delLbl = lv_label_create(delBtn);
         lv_label_set_text(delLbl, LV_SYMBOL_TRASH);
@@ -968,6 +1042,16 @@ void watchUiRefreshSettings(bool wifi, bool bt, bool btdisc,
     syncSw(SET_SILENT,  silent);
     syncSw(SET_LOGGING, logging);
     syncSw(SET_COM,     com);
+}
+
+void watchUiSetAutostartToggle(bool on) {
+    syncSw(SET_AUTOSTART, on);
+}
+
+WatchUiPendingExtras watchUiConsumePendingExtras() {
+    WatchUiPendingExtras p = s_pendingExtras;
+    s_pendingExtras = WatchUiPendingExtras{};
+    return p;
 }
 
 // ---- First-boot walkthrough overlay ----------------------------------------

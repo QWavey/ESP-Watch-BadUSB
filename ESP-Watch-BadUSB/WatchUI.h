@@ -28,13 +28,17 @@ bool watchUiConsumeStopPressed();
 // loop consumes these via watchUiConsumePendingScriptAction() so LVGL never
 // blocks on SD I/O.
 struct WatchUiPendingScriptAction {
-    bool has_run;      char run_name[64];
-    bool has_delete;   char delete_name[64];
+    bool has_run;              char run_name[64];
+    bool has_delete;           char delete_name[64];
+    bool has_toggle_autostart; char autostart_name[64];  // "" clears
 };
 WatchUiPendingScriptAction watchUiConsumePendingScriptAction();
 
-// Feed the list to the UI. Pass an ordered vector of script basenames.
-void watchUiSetFileList(const std::vector<String>& names);
+// Feed the list to the UI. Pass an ordered vector of script basenames and
+// the current autostart target (empty = none); the matching row's star
+// paints filled yellow.
+void watchUiSetFileList(const std::vector<String>& names,
+                        const String& autostartName = String());
 
 // Show a transient banner across the whole home tab: SD inserted / removed,
 // power-off countdown, etc. Pass nullptr to hide.
@@ -81,6 +85,15 @@ struct WatchUiPendingSettings {
 WatchUiPendingSettings watchUiConsumePendingSettings();
 void watchUiRefreshSettings(bool wifi, bool bt, bool btdisc,
                             bool led,  bool silent, bool logging, bool com);
+void watchUiSetAutostartToggle(bool on);
+
+// ---- Autostart / Reset-to-standard / Brick firmware --------------------
+struct WatchUiPendingExtras {
+    bool has_autostart;   bool autostart_on;
+    bool want_reset_std;   // Reset every user toggle to OFF + wipe boot_script
+    bool want_brick;       // Set bricked=true; on next boot only the clock runs
+};
+WatchUiPendingExtras watchUiConsumePendingExtras();
 
 typedef void (*WatchUiWalkthroughDone)();
 void watchUiShowWalkthrough(const char* ssid, const char* psk, const char* ip,
