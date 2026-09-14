@@ -341,22 +341,32 @@ void setup() {
   // enough time to attach the generic "USB JTAG/serial debug unit" — moving
   // this up is what makes silent actually silent.
   {
+    // Watch port RECOVERY: user reported "connecting/disconnecting the
+    // whole time" — the classic silent-boot USB-PHY-kill loop. Even though
+    // this build's migration flips silent_boot=false, a pref persisted from
+    // a prior session runs FIRST here at STEP 0 (before the migration in
+    // setup body) and re-arms usbBeginSilent(). Kill silent boot
+    // UNCONDITIONALLY on entry: read the pref only to log intent, but never
+    // call usbBeginSilent from the boot path. The wearer can still enable
+    // "silent" from Settings if a future build re-adds that path, but for
+    // now (Watch has no LED anyway) silent-at-boot is off the table.
     Preferences bootPrefs;
-    bootPrefs.begin("badusb", true);   // read-only
-    // Watch port: DEFAULT to false. On a fresh-erased NVS the Key's original
-    // `true` default made usbBeginSilent() kill the USB PHY pads at every
-    // boot, the host then USB-reset the chip back into ROM, we boot again,
-    // repeat forever. Infinite USB_UART_CHIP_RESET loop confirmed on the
-    // watch via serial log. The user can still enable silent boot via the
-    // AMOLED settings toggle or the web UI.
+    bootPrefs.begin("badusb", false);
     bool silent = bootPrefs.getBool("silent_boot", false);
-    bootPrefs.end();
     if (silent) {
-      usbBeginSilent();      // disables USB PHY pads before any enumeration
-      silentArmForNextBoot();// persist so the C++ constructor kills USB earlier next boot
-    } else {
-      silentClearForNextBoot();
+      Serial.println("[BOOT] silent_boot=true was persisted — DISABLING and clearing to prevent USB-PHY-kill loop");
+      bootPrefs.putBool("silent_boot", false);
     }
+    // Also defensively clear the brick flag if it's set — the wearer
+    // reflashes to recover, and the only way to hit this code path is a
+    // fresh flash-mode upload.
+    if (bootPrefs.getBool("bricked", false)) {
+      Serial.println("[BOOT] bricked=true was persisted — clearing (reflash implies recovery)");
+      bootPrefs.putBool("bricked", false);
+    }
+    bootPrefs.end();
+    // Never call usbBeginSilent here in the recovery build.
+    silentClearForNextBoot();
   }
 
   Serial.begin(115200);
