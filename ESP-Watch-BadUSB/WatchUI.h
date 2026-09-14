@@ -40,6 +40,31 @@ void watchUiSetFileList(const std::vector<String>& names);
 // power-off countdown, etc. Pass nullptr to hide.
 void watchUiSetBanner(const char* text, uint32_t rgb = 0x2A2A30);
 
+// ---- Clock face + swipe reveal -----------------------------------------
+// A minimal full-screen clock (HH:MM, uptime-derived) sits on top of the
+// tabview at boot. Swipe DOWN dismisses it → tabs visible. Swipe UP anywhere
+// on the tabview brings it back. Set the clock's display time (seconds).
+void watchUiShowClock();
+void watchUiHideClock();
+bool watchUiClockVisible();
+void watchUiSetClockSeconds(uint32_t seconds);
+
+// ---- Power-off long-press countdown -----------------------------------
+// The main loop polls AXP2101 PEK IRQs. On press-edge it calls
+// watchUiBeginPowerHold(); each tick refreshes with remaining seconds.
+// On release-edge it calls watchUiEndPowerHold(). >0 remaining shows the
+// countdown banner in danger red.
+void watchUiBeginPowerHold();
+void watchUiSetPowerHoldRemaining(int seconds);
+void watchUiEndPowerHold();
+
+// ---- Screen sleep ------------------------------------------------------
+// The main loop tracks LVGL inactivity and calls these on idle > threshold
+// / on touch wake so the AMOLED can go dark to save battery.
+void watchUiScreenSleep();
+void watchUiScreenWake();
+bool watchUiScreenAsleep();
+
 // ---- settings-tab bridges ----
 struct WatchUiPendingSettings {
     bool has_wifi;          bool wifi_on;

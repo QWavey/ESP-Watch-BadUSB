@@ -21,9 +21,16 @@ void setupAP() {
   // produced AP_STOP bounces or auth failures. Vanilla wins.
   WiFi.mode(WIFI_AP);
 
-  if (!WiFi.softAP(ap_ssid.c_str(), ap_password.c_str())) {
+  // Web-crash mitigation: cap softAP to 4 stations (default). Above that,
+  // the ESP32 core WebServer library has been observed to reset the chip
+  // when clients churn (phone browser leaves the page → half-open socket
+  // never cleaned up, then next connect crashes on WiFiServer::available()).
+  // Also raise the beacon interval slightly and use a fixed channel so the
+  // ROM's AP task doesn't roam.
+  if (!WiFi.softAP(ap_ssid.c_str(), ap_password.c_str(), /*channel=*/1,
+                   /*ssid_hidden=*/0, /*max_connection=*/4)) {
     Serial.println("[WiFi] Failed to setup AP with password — trying open AP");
-    WiFi.softAP(ap_ssid.c_str());
+    WiFi.softAP(ap_ssid.c_str(), NULL, 1, 0, 4);
   }
   // Watch port bug hunt: default modem sleep on the AP path parks the radio
   // between beacons — TCP RTTs balloon and pages "load forever" in the

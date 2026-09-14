@@ -56,6 +56,15 @@ static WatchUiPendingSettings s_pending = {};
 static WatchUiPendingScriptAction s_pendingAction = {};
 static uint32_t s_bannerUntil = 0;
 
+// Clock overlay + power-hold + screen-sleep state
+static lv_obj_t* s_clockRoot   = nullptr;
+static lv_obj_t* s_clockTime   = nullptr;   // large HH:MM
+static lv_obj_t* s_clockHint   = nullptr;   // "swipe down to reveal"
+static lv_obj_t* s_tabView     = nullptr;   // captured for swipe-up handler
+static bool      s_powerHold   = false;
+static bool      s_screenAsleep = false;
+extern class ScreenClass Screen;            // forward-declared instance in header
+
 // ---- design tokens ---------------------------------------------------------
 // Restrained palette — one neutral ground, one accent, one danger. Nothing
 // glows. Nothing gradients. Same colour discipline the hub SVGs use.
@@ -95,6 +104,13 @@ static void tryInitPMU() {
         s_pmuReady = true;
         s_pmu.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
         s_pmu.clearIrqStatus();
+        // Watch port: keep the power-key IRQs latched so we can poll the
+        // status register in watchUiTick and drive a hold-to-power-off
+        // countdown. We NEVER wire the AXP2101's INT pin to a GPIO here —
+        // polling the latch is enough at 100 ms cadence.
+        s_pmu.enableIRQ(XPOWERS_AXP2101_PKEY_NEGATIVE_IRQ |
+                        XPOWERS_AXP2101_PKEY_POSITIVE_IRQ |
+                        XPOWERS_AXP2101_PKEY_LONG_IRQ);
         s_pmu.enableBattDetection();
         s_pmu.enableBattVoltageMeasure();
         s_pmu.enableSystemVoltageMeasure();
@@ -463,6 +479,7 @@ void watchUiBegin() {
 
     // Tabview: two tabs, big enough tap targets for a wrist screen.
     lv_obj_t* tv = lv_tabview_create(scr);
+    s_tabView = tv;
     lv_obj_set_size(tv, LCD_W, LCD_H);
     lv_tabview_set_tab_bar_size(tv, 56);
     lv_obj_set_style_bg_color(tv, lvhex(C_BG), 0);
@@ -488,23 +505,40 @@ void watchUiBegin() {
     lv_obj_set_style_border_side (tabBar, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_width(tabBar, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_color(tabBar, lvhex(C_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
-    // "Settings tab stretched like italic font" fix: LVGL's default theme
-    // applies transform_scale/transform_zoom to the checked and pressed
-    // tab-button states — the whole button (icon + label) rubber-bands wider
-    // for a beat when selected. Pin scale to 100% in every state.
-    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS);
-    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS);
-    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_PRESSED);
-    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_PRESSED);
-    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED | LV_STATE_PRESSED);
-    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED | LV_STATE_PRESSED);
+    // "Tab stretched like italic font" — after v1 (transform_scale only) still
+    // reproduced on the Files tab, the real culprit is the default theme
+    // widening the checked tab-item via BIGGER text_letter_space + a slightly
+    // heavier text_font. Force both to the same fixed values across every
+    // state on every part of the tab-button, and lock its horizontal padding
+    // so the button's own layout can't change size on select.
+    {
+      const auto pin = [&](lv_state_t st) {
+        lv_style_selector_t sel = LV_PART_ITEMS | st;
+        lv_obj_set_style_transform_scale_x(tabBar, 256, sel);
+        lv_obj_set_style_transform_scale_y(tabBar, 256, sel);
+        lv_obj_set_style_text_letter_space(tabBar, 0, sel);
+        lv_obj_set_style_text_font(tabBar, &lv_font_montserrat_18, sel);
+        lv_obj_set_style_pad_hor(tabBar, 12, sel);
+        lv_obj_set_style_pad_ver(tabBar, 0, sel);
+        lv_obj_set_style_anim_duration(tabBar, 0, sel);
+      };
+      pin((lv_state_t)LV_STATE_DEFAULT);
+      pin((lv_state_t)LV_STATE_CHECKED);
+      pin((lv_state_t)LV_STATE_PRESSED);
+      pin((lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED));
+      pin((lv_state_t)LV_STATE_FOCUS_KEY);
+      pin((lv_state_t)LV_STATE_FOCUSED);
+    }
     // Disable tab-switch slide animation — feels laggy on QSPI AMOLED.
     lv_obj_set_style_anim_duration(tv, 0, 0);
-    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS);
-    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS | LV_STATE_PRESSED);
+
+    // Swipe-up on the tabview brings the clock back. LVGL emits a
+    // LV_EVENT_GESTURE with LV_DIR_TOP when the user drags upward.
+    lv_obj_add_event_cb(tv, [](lv_event_t* e){
+        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+        lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+        if (d == LV_DIR_TOP) watchUiShowClock();
+    }, LV_EVENT_GESTURE, nullptr);
 
     s_tabHome  = lv_tabview_add_tab(tv, LV_SYMBOL_HOME     "  Home");
     s_tabFiles = lv_tabview_add_tab(tv, LV_SYMBOL_FILE     "  Files");
@@ -513,8 +547,117 @@ void watchUiBegin() {
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
+    // Clock face — shown at boot; swipe down to reveal the tabview.
+    watchUiShowClock();
+
     Serial.println("[WatchUI] Ready");
 }
+
+// ---- Clock overlay ---------------------------------------------------------
+static void clockGestureCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    if (d == LV_DIR_BOTTOM) watchUiHideClock();   // "swipe down to reveal"
+    // Tapping the clock also dismisses — most users try that first.
+}
+static void clockClickCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    watchUiHideClock();
+}
+
+void watchUiShowClock() {
+    if (s_clockRoot) {
+        lv_obj_clear_flag(s_clockRoot, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    s_clockRoot = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_clockRoot);
+    lv_obj_set_size(s_clockRoot, LCD_W, LCD_H);
+    lv_obj_set_pos(s_clockRoot, 0, 0);
+    lv_obj_set_style_bg_color(s_clockRoot, lvhex(C_BG), 0);
+    lv_obj_set_style_bg_opa(s_clockRoot, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_clockRoot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_clockRoot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_clockRoot, clockGestureCb, LV_EVENT_GESTURE, nullptr);
+    lv_obj_add_event_cb(s_clockRoot, clockClickCb,   LV_EVENT_CLICKED, nullptr);
+
+    s_clockTime = lv_label_create(s_clockRoot);
+    lv_label_set_text(s_clockTime, "00:00");
+    lv_obj_set_style_text_color(s_clockTime, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_clockTime, &lv_font_montserrat_48, 0);
+    lv_obj_align(s_clockTime, LV_ALIGN_CENTER, 0, -10);
+
+    s_clockHint = lv_label_create(s_clockRoot);
+    lv_label_set_text(s_clockHint, LV_SYMBOL_DOWN "  swipe down to reveal");
+    lv_obj_set_style_text_color(s_clockHint, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(s_clockHint, &lv_font_montserrat_16, 0);
+    lv_obj_align(s_clockHint, LV_ALIGN_BOTTOM_MID, 0, -40);
+}
+
+void watchUiHideClock() {
+    if (!s_clockRoot) return;
+    lv_obj_del(s_clockRoot);
+    s_clockRoot = nullptr;
+    s_clockTime = nullptr;
+    s_clockHint = nullptr;
+}
+
+bool watchUiClockVisible() {
+    return s_clockRoot != nullptr;
+}
+
+void watchUiSetClockSeconds(uint32_t seconds) {
+    if (!s_clockTime) return;
+    uint32_t h = seconds / 3600;
+    uint32_t m = (seconds / 60) % 60;
+    static char last[8] = "";
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)h, (unsigned)m);
+    if (strcmp(last, buf) == 0) return;
+    strncpy(last, buf, sizeof(last));
+    lv_label_set_text(s_clockTime, buf);
+}
+
+// ---- Power-off long-press countdown ---------------------------------------
+void watchUiBeginPowerHold() {
+    s_powerHold = true;
+    watchUiSetBanner(LV_SYMBOL_POWER "  Hold to power off (4)", 0xC8442D);
+}
+void watchUiSetPowerHoldRemaining(int seconds) {
+    if (!s_powerHold) return;
+    if (seconds <= 0) {
+        watchUiSetBanner(LV_SYMBOL_POWER "  Powering off...", 0xC8442D);
+        return;
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf),
+             LV_SYMBOL_POWER "  Hold %d s to power off", seconds);
+    watchUiSetBanner(buf, 0xC8442D);
+}
+void watchUiEndPowerHold() {
+    if (!s_powerHold) return;
+    s_powerHold = false;
+    watchUiSetBanner(nullptr);
+}
+
+// ---- Screen sleep ---------------------------------------------------------
+// AMOLED: painting black = pixels dark = ~0 power. Screen.off() blanks the
+// framebuffer. We also freeze LVGL's redraw so wake latency is a single flush.
+void watchUiScreenSleep() {
+    if (s_screenAsleep) return;
+    s_screenAsleep = true;
+    Screen.off();
+}
+void watchUiScreenWake() {
+    if (!s_screenAsleep) return;
+    s_screenAsleep = false;
+    // Force a full repaint so the wake tap doesn't stare at a black screen.
+    lv_obj_invalidate(lv_scr_act());
+    lv_obj_t* top = lv_layer_top();
+    if (top) lv_obj_invalidate(top);
+    Screen.on();
+}
+bool watchUiScreenAsleep() { return s_screenAsleep; }
 
 void watchUiTick() {
     unsigned long now = millis();
@@ -541,11 +684,45 @@ void watchUiTick() {
     (void)s_lastBlinkTick;
     (void)s_blinkOn;
 
-    // Banner timeout
+    // Banner timeout — the power-hold banner suppresses auto-hide so the
+    // countdown stays visible while the wearer keeps the key down.
     if (s_bannerLbl && !(lv_obj_has_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN))) {
-        if (s_bannerUntil && now > s_bannerUntil) {
+        if (!s_powerHold && s_bannerUntil && now > s_bannerUntil) {
             lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
             s_bannerUntil = 0;
+        }
+    }
+
+    // Power-key hold poll — AXP2101 latches negative (press) and positive
+    // (release) IRQs; we watch the state and drive the countdown banner.
+    // AXP2101 default long-press timeout for power-off is ~4 s.
+    if (s_pmuReady) {
+        static bool     pkeyDown       = false;
+        static uint32_t pkeyDownStart  = 0;
+        static unsigned long lastPoll  = 0;
+        if (now - lastPoll >= 100) {
+            lastPoll = now;
+            s_pmu.getIrqStatus();   // refresh cached status
+            if (s_pmu.isPekeyNegativeIrq()) {
+                pkeyDown = true;
+                pkeyDownStart = now;
+                watchUiBeginPowerHold();
+                s_pmu.clearIrqStatus();
+            }
+            if (s_pmu.isPekeyPositiveIrq()) {
+                pkeyDown = false;
+                watchUiEndPowerHold();
+                s_pmu.clearIrqStatus();
+            }
+            if (pkeyDown) {
+                const uint32_t HOLD_MS = 4000;
+                uint32_t elapsed = now - pkeyDownStart;
+                int remaining = elapsed >= HOLD_MS ? 0
+                                : (int)((HOLD_MS - elapsed + 999) / 1000);
+                watchUiSetPowerHoldRemaining(remaining);
+                // AXP2101 handles the actual shutdown at its long-press
+                // threshold — we just paint the countdown until it fires.
+            }
         }
     }
 

@@ -895,6 +895,34 @@ void loop() {
   // Watch port: pump LVGL, redraw the LED dot / status line / clients count,
   // and consume on-screen STOP-button presses. Non-blocking (~2 ms typical).
   watchUiTick();
+
+  // Clock face — update HH:MM every second while the overlay is visible.
+  // Uses uptime, not NTP, because this device runs offline.
+  {
+    static unsigned long lastClock = 0;
+    if (watchUiClockVisible() && millis() - lastClock >= 1000) {
+      lastClock = millis();
+      watchUiSetClockSeconds(millis() / 1000);
+    }
+  }
+
+  // Inactivity screen-off: after 60 s of no touch, blank the AMOLED. Any
+  // touch resets LVGL's inactive-time counter, so the next tap wakes it.
+  {
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck >= 500) {
+      lastCheck = millis();
+      uint32_t idle = lv_display_get_inactive_time(NULL);
+      const uint32_t SLEEP_MS = 60000;
+      if (!watchUiScreenAsleep() && idle >= SLEEP_MS) {
+        watchUiScreenSleep();
+      } else if (watchUiScreenAsleep() && idle < SLEEP_MS) {
+        // LVGL resets inactive_time on any indev activity — this branch
+        // fires on the wake tap.
+        watchUiScreenWake();
+      }
+    }
+  }
   if (watchUiConsumeStopPressed()) {
     if (scriptRunning) {
       stopRequested = true;
