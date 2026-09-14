@@ -355,7 +355,12 @@ static void buildSettingsTab(lv_obj_t* tab) {
     makeSwitchRow(tab, LV_SYMBOL_EYE_OPEN,  "BT discovery",    false, settingSwitchCb, SET_BTDISC);
 
     // Section: Behaviour
-    makeSwitchRow(tab, LV_SYMBOL_POWER,     "Status LED",      true, settingSwitchCb, SET_LED);
+    // Watch port: NO status LED on this board (no hardware LED, no RGB
+    // pixel). The "Status LED" row is a stale carry-over from the Key.
+    // Row omitted; LED_PIN in Config.h is only kept for the LEDManager
+    // shim compile-compat. Firmware reports hidden_settings=["led"] via
+    // /api/stats so the web UI can hide its toggle too.
+    // makeSwitchRow(tab, LV_SYMBOL_POWER, "Status LED", true, settingSwitchCb, SET_LED);
     makeSwitchRow(tab, LV_SYMBOL_EYE_CLOSE, "Silent startup",  true, settingSwitchCb, SET_SILENT);
     makeSwitchRow(tab, LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
     makeSwitchRow(tab, LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);

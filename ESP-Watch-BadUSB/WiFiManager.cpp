@@ -123,6 +123,12 @@ bool wifiScanComplete() {
 // Called every loop() tick — collects async scan results without blocking
 void pollWiFiScan() {
   if (!wifiScanStarted) return;
+  // Watch port perf: was hitting WiFi.scanComplete() every ~1 ms while a
+  // scan runs — 1000-3000 driver calls per scan. Gate to 100 ms; well
+  // under the startWiFiScan() 200 ms settle and the 15 s timeout.
+  static unsigned long s_lastPoll = 0;
+  if (millis() - s_lastPoll < 100) return;
+  s_lastPoll = millis();
 
   int n = WiFi.scanComplete();
   if (n == WIFI_SCAN_RUNNING) {

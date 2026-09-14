@@ -108,11 +108,28 @@ void setupBT() {
 }
 
 void loopBT() {
+    // Watch port BT freeze fix (user report: "enabling bluetooth froze
+    // ESP + web became unresponsive"):
+    //   1. Was calling pServer->startAdvertising() without a null guard.
+    //      stopBT() deinits BLE but pServer stays non-null, so next
+    //      disconnect edge crashes → hard freeze until wdt.
+    //   2. delay(500) on the disconnect edge blocked the main loop for
+    //      500 ms every disconnect — server.handleClient, watchUiTick,
+    //      HID all stalled — visible as "web unresponsive".
+    // Now: null-guard pServer; replace the delay with a millis()-based
+    // 500 ms re-advertise timer so the loop stays fluid.
+    if (!pServer) return;
+    static unsigned long s_reAdvAt = 0;
     if (!deviceConnected && oldDeviceConnected) {
-        delay(500); // give the bluetooth stack the chance to get things ready
-        pServer->startAdvertising(); // restart advertising
-        Serial.println("Start advertising");
+        s_reAdvAt = millis() + 500;
         oldDeviceConnected = deviceConnected;
+    }
+    if (s_reAdvAt && millis() >= s_reAdvAt) {
+        s_reAdvAt = 0;
+        if (pServer) {
+            pServer->startAdvertising();
+            Serial.println("Start advertising");
+        }
     }
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = deviceConnected;
@@ -120,7 +137,17 @@ void loopBT() {
 }
 
 void stopBT() {
+    // Watch port BT freeze fix: BLEDevice::deinit() frees the underlying
+    // NimBLE objects but the raw pointers stay dangling. Next loopBT() /
+    // scanBT() / startBTAdvertising() call derefs freed memory → crash.
+    // NULL every cached pointer here.
     BLEDevice::deinit();
+    pServer            = nullptr;
+    pTxCharacteristic  = nullptr;
+    pBLEScan           = nullptr;
+    deviceConnected    = false;
+    oldDeviceConnected = false;
+    btScanning         = false;
 }
 
 void scanBT() {
@@ -131,10 +158,13 @@ void scanBT() {
         Serial.println("[BT] scanBT: BT not initialised — skipped");
         return;
     }
+    // Watch port: was pBLEScan->start(5, false) — synchronous 5s block.
+    // Cut to 2 s so the main loop isn't frozen for a full 5 s cycle when
+    // BT discovery is on. Still plenty to catch nearby advertising devices.
     foundBTDevices.clear();
     Serial.println("Scanning for BT devices...");
     btScanning = true;
-    BLEScanResults* foundDevices = pBLEScan->start(5, false);
+    BLEScanResults* foundDevices = pBLEScan->start(2, false);
     btScanning = false;
     if (foundDevices) {
         Serial.print("BT Devices found: ");

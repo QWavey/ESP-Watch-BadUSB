@@ -47,6 +47,10 @@
 // Idle drop:       nothing above true, no HTTP client for 5 s.
 static uint32_t lastActivityMs = 0;
 static uint32_t currentCpuMhz  = 240;
+// Watch port perf: file-scope cache for WiFi.softAPgetStationNum(). Was
+// called 3x per ~1 kHz loop; every call goes through the WiFi driver.
+// Refreshed at 4 Hz in loop() below.
+static int      g_apStations   = 0;
 static bool     cpuMgmtEnabled = true;
 
 void cpuNoteActivity() {
@@ -317,7 +321,7 @@ static void cpuMgmtTick() {
   }
   // Keep boosted while any WiFi client is connected — the browser polls
   // /api/stats every 3 s, so demoting mid-request stutters the UI.
-  if (WiFi.softAPgetStationNum() > 0) {
+  if (g_apStations > 0) {   // cached at 4 Hz in loop(); see g_apStations decl.
     if (currentCpuMhz != 240) { setCpuFrequencyMhz(240); currentCpuMhz = 240; }
     lastActivityMs = millis();
     return;
@@ -872,8 +876,16 @@ void loop() {
   }
 
   server.handleClient();
-  loopCaptivePortal();   // service captive-portal DNS
-  comShellLoop();        // v4.5: COM-port shell over USB CDC (if enabled)
+  // Watch port perf: rate-limit the auxiliary loops. loop() runs at ~1 kHz;
+  // captive DNS is fine at 100 Hz, CDC shell at 100 Hz.
+  {
+    static unsigned long s_lastNet = 0;
+    if (millis() - s_lastNet >= 10) {
+      s_lastNet = millis();
+      loopCaptivePortal();   // service captive-portal DNS
+      comShellLoop();        // v4.5: COM-port shell over USB CDC (if enabled)
+    }
+  }
   hostLedTick();         // v4.23: copy LED byte from USB task -> variables safely on main task
   handleLED();
   cpuMgmtTick();         // drop to 80 MHz after 5 s idle (thermal management)
@@ -896,8 +908,11 @@ void loop() {
   // Watch port: consume any settings the user toggled on the AMOLED
   // settings screen. LVGL callbacks only stashed the intent — we apply
   // it here on the main task so WiFi/BT/NVS never get touched from the
-  // LVGL event thread.
-  {
+  // LVGL event thread. Rate-limited to 50 Hz — human tap events are on
+  // human-time scales, no point polling this at 1 kHz.
+  static unsigned long s_lastSet = 0;
+  if (millis() - s_lastSet >= 20) {
+    s_lastSet = millis();
     WatchUiPendingSettings p = watchUiConsumePendingSettings();
     auto putIfChanged = [](const char* key, bool v){
       if (preferences.getBool(key, !v) != v) preferences.putBool(key, v);
@@ -943,7 +958,11 @@ void loop() {
     if (p.want_reboot) {
       watchUiFlash("Rebooting...");
       for (int i = 0; i < 20; ++i) { watchUiTick(); delay(20); }
-      ESP.restart();
+      // Watch port: usb_persist_restart(RESTART_NO_PERSIST) does a clean
+      // TinyUSB shutdown before reset — plain ESP.restart() on the S3 can
+      // leave the ROM stub in a half-init state and the chip boots into
+      // download mode instead of the app.
+      usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (p.want_factory_reset) {
       watchUiFlash("Factory reset - hold WIPE 5 s to confirm");
@@ -988,7 +1007,11 @@ void loop() {
   // v4.24: button polling moved to pumpButton() so WAIT_FOR_BUTTON_PRESS
   // shares the same debounced state machine (10s factory-reset still fires
   // during a WAIT; BUTTON_DEF handler auto-runs on short-press when idle).
-  pumpButton();
+  // Watch port perf: gate to 200 Hz — debounce is 40 ms, no need for 1 kHz.
+  {
+    static unsigned long s_lastBtn = 0;
+    if (millis() - s_lastBtn >= 5) { s_lastBtn = millis(); pumpButton(); }
+  }
 
   // Status updates
   if (millis() - lastStatusUpdate >= STATUS_UPDATE_INTERVAL) {
@@ -999,21 +1022,33 @@ void loop() {
     }
   }
 
+  // Watch port perf: cache softAPgetStationNum() at 4 Hz. Was being called
+  // 3x per loop iteration (~1 kHz), each hitting the WiFi driver. g_apStations
+  // is file-scope so cpuMgmtTick() reads it too.
+  static unsigned long s_lastApSta = 0;
+  if (millis() - s_lastApSta >= 250) {
+    s_lastApSta = millis();
+    g_apStations = (int)WiFi.softAPgetStationNum();
+  }
+
   // Run the boot script ONCE per connection session, not on every loop.
-  // Without this guard it re-fires continuously while any client stays
-  // connected (scriptRunning clears the moment the script ends).
-  static bool bootScriptHasRun = false;
-  int bootStations = WiFi.softAPgetStationNum();
-  if (bootStations == 0) bootScriptHasRun = false;   // rearm when everyone leaves
-  if (bootModeEnabled && bootStations > 0 && !scriptRunning && !bootScriptHasRun) {
-    bootScriptHasRun = true;
-    Serial.println("Client connected - executing boot script");
-    logCommand("BOOT_SCRIPT", "Executing boot script on client connection");
-    executeScript(bootScript);
+  // Guard first on bootModeEnabled so we skip the whole compare when not armed.
+  if (bootModeEnabled) {
+    static bool bootScriptHasRun = false;
+    if (g_apStations == 0) bootScriptHasRun = false;   // rearm when everyone leaves
+    if (g_apStations > 0 && !scriptRunning && !bootScriptHasRun) {
+      bootScriptHasRun = true;
+      Serial.println("Client connected - executing boot script");
+      logCommand("BOOT_SCRIPT", "Executing boot script on client connection");
+      executeScript(bootScript);
+    }
   }
 
   // Background processing for Rower and Automation
-  processRower();
+  {
+    static unsigned long s_lastRower = 0;
+    if (millis() - s_lastRower >= 50) { s_lastRower = millis(); processRower(); }
+  }
   processAutomation();
   processAutoConnect();
   processBackgroundTasks();

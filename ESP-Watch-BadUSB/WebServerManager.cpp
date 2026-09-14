@@ -11,7 +11,18 @@
 #include "AttackMode.h"
 #include "MSCManager.h"          // v4.9: mscBaseSector/mscSubSectors for /api/stats
 #include "WatchUI.h"             // watchUiFlash / watchUiTick for on-screen feedback
+#include "esp32-hal-tinyusb.h"   // usb_persist_restart — clean USB shutdown before reset
 #include <ArduinoJson.h>
+
+// Watch port: ESP.restart() on the ESP32-S3 with USB-Serial/JTAG can leave
+// the ROM stub in a half-init state → chip boots into download mode after
+// setup wizard's "reboot" step, forcing the user to unplug/replug USB.
+// usb_persist_restart(RESTART_NO_PERSIST) registers the TinyUSB shutdown
+// handler first so the host sees a clean unplug before reset — the chip
+// then boots the app normally.
+static inline void watchSafeRestart() {
+  usb_persist_restart(RESTART_NO_PERSIST);
+}
 
 void setupWebServer() {
   server.enableCORS(true);
@@ -381,7 +392,7 @@ $('#go').addEventListener('click', async () => {
     preferences.remove   ("msc_sect");
     server.send(200, "application/json", "{\"ok\":true,\"status\":\"ATTACKMODE reset - rebooting to rebuild descriptors\"}");
     delay(300);
-    ESP.restart();
+    watchSafeRestart();
   });
 
   // Silent Startup (stealth HID): persist + apply immediately (no reboot needed)
@@ -650,7 +661,7 @@ $('#go').addEventListener('click', async () => {
     watchUiFlash("WiFi saved — rebooting");
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
-    ESP.restart();
+    watchSafeRestart();
   });
 
   server.on("/api/set-boot-script", HTTP_POST, []() {
@@ -712,6 +723,20 @@ $('#go').addEventListener('click', async () => {
 
   server.on("/api/stats", []() {
     DynamicJsonDocument doc(4096);
+    // Watch port: expose a `hidden_settings` list so a single dashboard
+    // HTML can serve every firmware variant. The frontend reads this array
+    // on /api/stats and hides any switch/setting whose `data-setting`
+    // attribute matches an entry here. Extend the list when a firmware
+    // variant lacks a physical feature. Key/devkitc variants can ship
+    // the same index.html and just leave this array empty (their build
+    // of /api/stats will return no entries).
+    {
+      JsonArray hidden = doc.createNestedArray("hidden_settings");
+      // Watch has no addressable / plain status LED — hide the "LED status"
+      // switch on both the AMOLED settings modal (already omitted) and the
+      // web dashboard.
+      hidden.add("led");
+    }
     doc["errorCount"] = errorCount;
     doc["totalScripts"] = totalScriptsExecuted;
     doc["totalCommands"] = totalCommandsExecuted;
@@ -935,7 +960,7 @@ $('#go').addEventListener('click', async () => {
 
     Serial.println("[FACTORY] Reboot in 1500 ms.");
     delay(1500);
-    ESP.restart();
+    watchSafeRestart();
   });
 
   // Tutorial state — the frontend calls this on skip / finish to mark the
@@ -1035,7 +1060,7 @@ $('#go').addEventListener('click', async () => {
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     // Let LWIP flush the 200 before we reset, and let the toast paint.
     for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
-    ESP.restart();
+    watchSafeRestart();
   });
 
   // ================================================================
@@ -1325,7 +1350,7 @@ $('#go').addEventListener('click', async () => {
     // Give the response a beat to flush, then reboot to rebuild the USB
     // descriptors with (or without) CDC.
     delay(200);
-    ESP.restart();
+    watchSafeRestart();
   });
 
   server.on("/api/validate-script", HTTP_POST, []() {
