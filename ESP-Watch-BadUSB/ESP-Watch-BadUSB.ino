@@ -537,16 +537,57 @@ void setup() {
   }
   // ------------------------------------------------------------------------
 
+  // ----- Watch port: first-boot "all off" migration ---------------------
+  // User request: a fresh unit should present with every feature toggle
+  // OFF and let the wearer opt in. We migrate the NVS once (guarded by
+  // prefs_off_v1) so an existing user's saved toggles are untouched on
+  // firmware upgrades — only truly-new devices see the reset.
+  if (!preferences.getBool("prefs_off_v1", false)) {
+    Serial.println("[BOOT] First boot after all-off migration — clearing toggles");
+    preferences.putBool("prefs_off_v1",    true);
+    preferences.putBool("led_enabled",     false);
+    preferences.putBool("logging_enabled", false);
+    preferences.putBool("autoconnect",     false);
+    preferences.putBool("save_creds",      false);
+    preferences.putBool("bt_discovery",    false);
+    preferences.putBool("silent_boot",     false);
+    preferences.putBool("wifi_toggle",     false);
+    preferences.putBool("bt_toggle",       false);
+    preferences.putBool("com_on",          false);
+    preferences.putBool("autostart_on",    false);
+    preferences.remove ("boot_script");
+  }
+
+  // ----- Bricked-mode gate ----------------------------------------------
+  // If the wearer picked "Brick Firmware" in Settings, only the clock face
+  // comes up. Everything else stays dormant until a re-flash flips the
+  // pref off. Checked here rather than at STEP 0 so USB/JTAG stays alive
+  // for recovery (unbrick via the /api endpoint below would need WiFi).
+  bool firmwareBricked = preferences.getBool("bricked", false);
+  if (firmwareBricked) {
+    Serial.println("[BOOT] Bricked mode — freezing everything but the clock");
+    watchUiFlash("Firmware bricked — reflash to recover");
+    for (;;) {
+      watchUiTick();
+      watchUiSetClockSeconds(millis() / 1000);
+      if (!watchUiClockVisible()) watchUiShowClock();
+      delay(50);
+    }
+  }
+
   ap_ssid = preferences.getString("ap_ssid", DEFAULT_AP_SSID);
   ap_password = preferences.getString("ap_password", DEFAULT_AP_PASSWORD);
   currentLanguage = preferences.getString("language", "us");
   wifiScanTime = preferences.getInt("wifi_scan_time", WIFI_SCAN_TIMEOUT);
-  ledEnabled = preferences.getBool("led_enabled", true);
+  ledEnabled = preferences.getBool("led_enabled", false);
   loggingEnabled = preferences.getBool("logging_enabled", false);
   autoConnectEnabled = preferences.getBool("autoconnect", false);
   saveOnConnectEnabled = preferences.getBool("save_creds", false);
   btDiscoveryEnabled = preferences.getBool("bt_discovery", false);
-  silentStartup = preferences.getBool("silent_boot", true);
+  silentStartup = preferences.getBool("silent_boot", false);
+  // Persist WiFi + BT enable state (defaults OFF — user opts in).
+  wifiToggleEnabled = preferences.getBool("wifi_toggle", false);
+  bluetoothToggleEnabled = preferences.getBool("bt_toggle", false);
   loadAttackModePrefs();     // ATTACKMODE + SIZE persisted from last boot
 
 
@@ -608,11 +649,21 @@ void setup() {
   logDebug("Active language: " + currentLanguage);
   logDebug("Keymap entries: " + String(currentKeymap.size()));
 
+  // Autostart gate — the wearer must have flipped "Autostart" in Settings
+  // for a boot script to actually run at boot. Even when boot_script has
+  // been set (via Files-tab star / SET_BOOT_SCRIPT / web UI), we only
+  // arm bootModeEnabled when autostart_on is true.
+  bool autostartEnabled = preferences.getBool("autostart_on", false);
   String bootPref = preferences.getString("boot_script", "");
   currentBootScriptFiles.clear();
   bootScript = "";
-  
-  if (bootPref.length() > 0) {
+
+  if (!autostartEnabled) {
+    // Log for visibility, then skip the load-and-arm path entirely.
+    if (bootPref.length() > 0 || SD.exists(String(DIR_SCRIPTS) + "/boot.txt")) {
+      Serial.println("[BOOT] Autostart disabled — boot script not loaded");
+    }
+  } else if (bootPref.length() > 0) {
     int start = 0;
     int end = bootPref.indexOf(',');
     while (end != -1) {
@@ -754,26 +805,36 @@ void setup() {
     Serial.println("Silent startup: USB deferred; HID attaches on demand");
   }
 
-  setupAP();
-  // Watch port: push AP creds + IP to the on-screen panel now that softAP
-  // is up. Users no longer need to squint at Serial to find the dashboard.
-  {
+  // Watch port: only bring up WiFi/AP if the wearer opted in. Fresh units
+  // ship with wifi_toggle=false so the radio is silent until enabled from
+  // Settings. Home tab shows "WiFi OFF" when disabled.
+  if (wifiToggleEnabled) {
+    setupAP();
     IPAddress ip = WiFi.softAPIP();
     watchUiSetAP(ap_ssid.c_str(), ap_password.c_str(), ip.toString().c_str());
+  } else {
+    Serial.println("[BOOT] WiFi disabled by pref — softAP not started");
+    watchUiSetAP("WiFi OFF", "-", "enable in Settings");
   }
   // Sync the on-screen Settings switches to the real state now that prefs
   // are loaded.
   {
-    bool comOn = preferences.getBool("com_on", false);
+    bool comOn      = preferences.getBool("com_on",       false);
+    bool autostart  = preferences.getBool("autostart_on", false);
     watchUiRefreshSettings(
-        /*wifi*/    true,
+        /*wifi*/    wifiToggleEnabled,
         /*bt*/      bluetoothToggleEnabled,
         /*btdisc*/  btDiscoveryEnabled,
         /*led*/     ledEnabled,
         /*silent*/  silentStartup,
         /*logging*/ loggingEnabled,
         /*com*/     comOn);
+    watchUiSetAutostartToggle(autostart);
   }
+  // Refresh the Files tab with the current autostart target so the row's
+  // star lights up if a script is set to autoboot.
+  watchUiSetFileList(availableScripts,
+                     preferences.getString("boot_script", ""));
   bluetoothName = preferences.getString("bt_name", "ESP32-S3");
   // Watch port: only init BLE if the user has turned it on. The BLE stack
   // consumes ~40 KB of internal heap and this watch's build lands the
@@ -966,6 +1027,7 @@ void loop() {
     }
     if (p.has_bt) {
       bluetoothToggleEnabled = p.bt_on;
+      putIfChanged("bt_toggle", bluetoothToggleEnabled);
       if (bluetoothToggleEnabled) { setupBT(); watchUiFlash("Bluetooth ON"); }
       else                        { stopBT();  watchUiFlash("Bluetooth OFF"); }
     }
@@ -975,10 +1037,20 @@ void loop() {
       watchUiFlash(btDiscoveryEnabled ? "BT discovery ON" : "BT discovery OFF");
     }
     if (p.has_wifi) {
-      // For now the WiFi switch is informational — the AP is required for
-      // the dashboard. Toast + persist the intent.
-      putIfChanged("wifi_toggle", p.wifi_on);
-      watchUiFlash(p.wifi_on ? "WiFi ON" : "WiFi OFF (dashboard needed)");
+      // Live toggle: bring softAP up or down without a reboot so the
+      // wearer sees the change immediately in the home tab.
+      wifiToggleEnabled = p.wifi_on;
+      putIfChanged("wifi_toggle", wifiToggleEnabled);
+      if (wifiToggleEnabled) {
+        setupAP();
+        IPAddress ip = WiFi.softAPIP();
+        watchUiSetAP(ap_ssid.c_str(), ap_password.c_str(), ip.toString().c_str());
+        watchUiFlash("WiFi ON");
+      } else {
+        stopAP();
+        watchUiSetAP("WiFi OFF", "-", "enable in Settings");
+        watchUiFlash("WiFi OFF");
+      }
     }
     if (p.has_com) {
       preferences.putBool("com_on", p.com_on);
@@ -1027,10 +1099,57 @@ void loop() {
       } else if (deleteScript(String(pa.delete_name))) {
         watchUiFlash((String("Deleted ") + pa.delete_name).c_str());
         loadAvailableScripts();
-        watchUiSetFileList(availableScripts);
+        watchUiSetFileList(availableScripts,
+                           preferences.getString("boot_script", ""));
       } else {
         watchUiFlash("Delete failed");
       }
+    }
+    if (pa.has_toggle_autostart) {
+      String newTarget = String(pa.autostart_name);
+      if (newTarget.length() == 0) {
+        preferences.remove("boot_script");
+        watchUiFlash("Autostart cleared");
+      } else {
+        preferences.putString("boot_script", newTarget);
+        watchUiFlash((String("Autostart: ") + newTarget).c_str());
+      }
+      watchUiSetFileList(availableScripts, newTarget);
+    }
+  }
+
+  // Autostart toggle + Reset-to-standard + Brick pending actions
+  {
+    WatchUiPendingExtras pe = watchUiConsumePendingExtras();
+    if (pe.has_autostart) {
+      preferences.putBool("autostart_on", pe.autostart_on);
+      watchUiFlash(pe.autostart_on ? "Autostart armed (next boot)"
+                                    : "Autostart disarmed (next boot)");
+    }
+    if (pe.want_reset_std) {
+      // Toggles → OFF, boot script cleared. Persistent NVS keys touched
+      // here mirror the first-boot migration path so both routes converge
+      // on the same "clean unit" state.
+      preferences.putBool("led_enabled",     false);
+      preferences.putBool("logging_enabled", false);
+      preferences.putBool("autoconnect",     false);
+      preferences.putBool("save_creds",      false);
+      preferences.putBool("bt_discovery",    false);
+      preferences.putBool("silent_boot",     false);
+      preferences.putBool("wifi_toggle",     false);
+      preferences.putBool("bt_toggle",       false);
+      preferences.putBool("com_on",          false);
+      preferences.putBool("autostart_on",    false);
+      preferences.remove("boot_script");
+      watchUiFlash("Reset to standard — rebooting");
+      for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
+      usb_persist_restart(RESTART_NO_PERSIST);
+    }
+    if (pe.want_brick) {
+      preferences.putBool("bricked", true);
+      watchUiFlash("Bricking — reflash to recover");
+      for (int i = 0; i < 40; ++i) { watchUiTick(); delay(20); }
+      usb_persist_restart(RESTART_NO_PERSIST);
     }
   }
 
@@ -1052,7 +1171,8 @@ void loop() {
       static size_t lastScriptCount = (size_t)-1;
       if (availableScripts.size() != lastScriptCount) {
         lastScriptCount = availableScripts.size();
-        watchUiSetFileList(availableScripts);
+        watchUiSetFileList(availableScripts,
+                           preferences.getString("boot_script", ""));
       }
     }
   }
@@ -1083,11 +1203,12 @@ void loop() {
       if (sdCardPresent) {
         watchUiSetBanner(LV_SYMBOL_SD_CARD "  SD card inserted", 0x2A5A2A);
         loadAvailableScripts();
-        watchUiSetFileList(availableScripts);
+        watchUiSetFileList(availableScripts,
+                           preferences.getString("boot_script", ""));
       } else {
         watchUiSetBanner(LV_SYMBOL_WARNING "  SD card removed", 0x5A2A2A);
         availableScripts.clear();
-        watchUiSetFileList(availableScripts);
+        watchUiSetFileList(availableScripts, String());
       }
     }
   }

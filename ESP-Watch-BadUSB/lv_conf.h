@@ -94,7 +94,10 @@
  *====================*/
 
 /** Default display refresh, input device read and animation step period. */
-#define LV_DEF_REFR_PERIOD  33      /**< [ms] */
+/* Watch port perf: 33 ms = 30 FPS. AMOLED can do 60 FPS easily and the QSPI
+ * flush is CPU-cheap because the buffer sits in PSRAM; drop to 20 ms so touch
+ * tracking feels sharper without eating measurable extra CPU. */
+#define LV_DEF_REFR_PERIOD  20      /**< [ms] */
 
 /** Default Dots Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  * (Not so important, you can adjust it to modify default sizes and spaces.) */
