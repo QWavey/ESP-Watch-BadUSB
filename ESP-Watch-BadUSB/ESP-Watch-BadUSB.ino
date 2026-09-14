@@ -807,15 +807,21 @@ void setup() {
     Serial.println("Silent startup: USB deferred; HID attaches on demand");
   }
 
-  // Watch port: only bring softAP up if the wearer opted in. Fresh units
-  // ship with wifi_toggle=false so the radio is silent; wearer flips it on
-  // from Settings. Home tab shows "WiFi OFF" while disabled.
-  if (wifiToggleEnabled) {
-    setupAP();
+  // Watch port: setupAP() always runs so the WiFi / LWIP / TCP-IP stack
+  // gets initialized (WebServer.begin() below assumes it has). Downstream
+  // code takes a semaphore that only exists once the WiFi driver has
+  // brought its queues up; a full skip crashes with "xQueueSemaphoreTake
+  // queue.c:1709 (( pxQueue ))" the moment the server binds. If the
+  // wearer wants WiFi off, we bring softAP down immediately after — the
+  // stack stays alive, only the radio + AP go silent.
+  setupAP();
+  {
     IPAddress ip = WiFi.softAPIP();
     watchUiSetAP(ap_ssid.c_str(), ap_password.c_str(), ip.toString().c_str());
-  } else {
-    Serial.println("[BOOT] WiFi disabled by pref — softAP not started");
+  }
+  if (!wifiToggleEnabled) {
+    Serial.println("[BOOT] WiFi disabled by pref — bringing softAP down after init");
+    stopAP();
     watchUiSetAP("WiFi OFF", "-", "enable in Settings");
   }
   // Sync the on-screen Settings switches to the real state now that prefs
