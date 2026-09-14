@@ -40,7 +40,13 @@
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
  */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_BUILTIN
+// Watch port RAM opt (scout finding #2): LVGL's builtin TLSF allocator
+// lives in a `work_mem_int[LV_MEM_SIZE]` global array in DRAM, eating
+// ~64 KB of internal memory forever. Switching to LV_STDLIB_CLIB makes
+// LVGL call plain malloc()/free(), which on this build (CONFIG_SPIRAM_
+// USE_MALLOC=y + SPIRAM_MALLOC_ALWAYSINTERNAL=4096) routes every alloc
+// > 4 KB to PSRAM automatically. Frees ~64 KB of DRAM.
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
 
 /** Possible values
  * - LV_STDLIB_BUILTIN:     LVGL's built in implementation

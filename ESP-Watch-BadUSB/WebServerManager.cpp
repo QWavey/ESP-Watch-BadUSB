@@ -10,6 +10,7 @@
 #include "BTManager.h"
 #include "AttackMode.h"
 #include "MSCManager.h"          // v4.9: mscBaseSector/mscSubSectors for /api/stats
+#include "WatchUI.h"             // watchUiFlash / watchUiTick for on-screen feedback
 #include <ArduinoJson.h>
 
 void setupWebServer() {
@@ -613,17 +614,29 @@ $('#go').addEventListener('click', async () => {
   });
 
   server.on("/api/save-wifi", HTTP_POST, []() {
+    // Same silent-400 fix as /api/setup-complete — reject with JSON +
+    // Serial log + on-screen toast so the wizard/settings panel can
+    // actually show the error, not sit spinning.
+    auto reject = [](int code, const char* err) {
+      Serial.printf("[/api/save-wifi] %d: %s\n", code, err);
+      watchUiFlash(err);
+      String body = String("{\"ok\":false,\"error\":\"") + err + "\"}";
+      server.send(code, "application/json", body);
+    };
     String body = server.arg("plain");
     DynamicJsonDocument doc(512);
-    DeserializationError error = deserializeJson(doc, body);
+    if (deserializeJson(doc, body)) { reject(400, "Invalid JSON body"); return; }
 
-    if (error) {
-      server.send(400, "text/plain; charset=utf-8", "Invalid JSON");
-      return;
+    String newSsid = doc["ssid"].as<String>();
+    String newPsk  = doc["password"].as<String>();
+    if (newSsid.length() == 0 || newSsid.length() > 32) {
+      reject(400, "SSID must be 1-32 chars"); return;
     }
-
-    ap_ssid = doc["ssid"].as<String>();
-    ap_password = doc["password"].as<String>();
+    if (newPsk.length() < 8 || newPsk.length() > 63) {
+      reject(400, "AP password must be 8-63 chars (WPA2)"); return;
+    }
+    ap_ssid = newSsid;
+    ap_password = newPsk;
     // v4.4: clamp scanTime — was unbounded; a user-supplied 0 broke scans and
     // a huge value could freeze the async scan flow.
     int t = doc["scanTime"] | WIFI_SCAN_TIMEOUT;
@@ -632,8 +645,11 @@ $('#go').addEventListener('click', async () => {
     wifiScanTime = t;
     saveSettings();
 
-    server.send(200, "text/plain; charset=utf-8", "WiFi settings saved. Rebooting...");
-    delay(1000);
+    Serial.printf("[/api/save-wifi] OK: ssid='%s' pw-len=%u — rebooting\n",
+                  newSsid.c_str(), (unsigned)newPsk.length());
+    watchUiFlash("WiFi saved — rebooting");
+    server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
+    for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
     ESP.restart();
   });
 
@@ -952,9 +968,24 @@ $('#go').addEventListener('click', async () => {
   // and refuse re-run after setup unless the caller supplies the current AP
   // password (blocks a guest on the AP from rewriting creds).
   server.on("/api/setup-complete", HTTP_POST, []() {
+    // Watch port bug hunt (recovered scout finding): every early-return
+    // path was `server.send(400, "text/plain", ...)` with NO Serial log
+    // and NO watchUiFlash. User taps "Save WiFi" in the wizard, ESP
+    // rejects (missing key / short PSK), wizard frontend doesn't surface
+    // the plain-text error, user sees "hang" — exact reported symptom.
+    // Now: every rejection logs to Serial, flashes on the AMOLED, and
+    // returns JSON with an `error` field so the frontend has structured
+    // data to render.
+    auto reject = [](int code, const char* err) {
+      Serial.printf("[/api/setup-complete] %d: %s\n", code, err);
+      watchUiFlash(err);
+      String body = String("{\"ok\":false,\"error\":\"") + err + "\"}";
+      server.send(code, "application/json", body);
+    };
+
     String body = server.arg("plain");
     DynamicJsonDocument doc(1024);
-    if (deserializeJson(doc, body)) { server.send(400, "text/plain", "Invalid JSON"); return; }
+    if (deserializeJson(doc, body)) { reject(400, "Invalid JSON body"); return; }
 
     // Post-setup lockdown: once setup_done=true, only the AP-password holder
     // can rerun the wizard.
@@ -962,7 +993,7 @@ $('#go').addEventListener('click', async () => {
     if (already) {
       String claimed = doc["currentPassword"] | "";
       if (claimed != ap_password) {
-        server.send(403, "text/plain", "Setup already completed. Supply currentPassword to rerun.");
+        reject(403, "Setup done — supply currentPassword to rerun");
         return;
       }
     }
@@ -973,7 +1004,7 @@ $('#go').addEventListener('click', async () => {
     // Required toggle keys - refuse silent defaults.
     if (!doc.containsKey("silentStartup") || !doc.containsKey("randomizeUsb") ||
         !doc.containsKey("randomizeMac")) {
-      server.send(400, "text/plain", "Missing required keys (silentStartup/randomizeUsb/randomizeMac)");
+      reject(400, "Missing keys: silentStartup / randomizeUsb / randomizeMac");
       return;
     }
     bool silent = doc["silentStartup"];
@@ -982,13 +1013,10 @@ $('#go').addEventListener('click', async () => {
 
     // Input validation.
     if (ssid.length() == 0 || ssid.length() > 32) {
-      server.send(400, "text/plain", "SSID must be 1-32 chars"); return;
+      reject(400, "SSID must be 1-32 chars"); return;
     }
-    // WPA2 requires 8-63 char password. Empty means "open AP" which we
-    // explicitly do NOT allow via the wizard - if the user wanted open,
-    // they can factory reset AP settings later.
     if (pw.length() < 8 || pw.length() > 63) {
-      server.send(400, "text/plain", "AP password must be 8-63 chars (WPA2 requirement)");
+      reject(400, "AP password must be 8-63 chars (WPA2)");
       return;
     }
 
@@ -999,9 +1027,14 @@ $('#go').addEventListener('click', async () => {
     preferences.putBool("usb_rndPid",  usbRnd);
     preferences.putBool("random_mac",  macRnd);
     preferences.putBool("setup_done",  true);
+    preferences.putBool("tutorial_done", true);
 
+    Serial.printf("[/api/setup-complete] OK: ssid='%s' pw-len=%u silent=%d — rebooting\n",
+                  ssid.c_str(), (unsigned)pw.length(), (int)silent);
+    watchUiFlash("Setup saved — rebooting");
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
-    delay(300);
+    // Let LWIP flush the 200 before we reset, and let the toast paint.
+    for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
     ESP.restart();
   });
 
