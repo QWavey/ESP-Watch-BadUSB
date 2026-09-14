@@ -8,6 +8,7 @@
 #include "ESP32-S3-Touch-AMOLED-2.06.h"
 #include <lvgl.h>
 #include <XPowersLib.h>
+#include <string>
 
 // Global instances the extern declarations in those headers point at.
 ScreenClass  Screen;
@@ -17,8 +18,8 @@ static bool       s_pmuReady = false;
 
 // ---- Home-tab LVGL objects the setters mutate ------------------------------
 static lv_obj_t* s_tabHome    = nullptr;
+static lv_obj_t* s_tabFiles   = nullptr;
 static lv_obj_t* s_tabSet     = nullptr;
-static lv_obj_t* s_ledDot     = nullptr;
 static lv_obj_t* s_statusLbl  = nullptr;
 static lv_obj_t* s_scriptLbl  = nullptr;
 static lv_obj_t* s_progress   = nullptr;
@@ -28,7 +29,10 @@ static lv_obj_t* s_ipLbl      = nullptr;
 static lv_obj_t* s_clientsLbl = nullptr;
 static lv_obj_t* s_battLbl    = nullptr;
 static lv_obj_t* s_flashLbl   = nullptr;
+static lv_obj_t* s_bannerLbl  = nullptr;
 static lv_obj_t* s_stopBtn    = nullptr;
+static lv_obj_t* s_filesList  = nullptr;   // scroll container inside the Files tab
+static lv_obj_t* s_filesEmpty = nullptr;   // "no scripts yet" placeholder
 
 // ---- Settings-tab switch handles (indexed by SETTING_*) -------------------
 enum SettingIdx {
@@ -49,6 +53,8 @@ static unsigned long s_lastLvglTick   = 0;
 static unsigned long s_lastBattPoll   = 0;
 static unsigned long s_lastPMUProbe   = 0;
 static WatchUiPendingSettings s_pending = {};
+static WatchUiPendingScriptAction s_pendingAction = {};
+static uint32_t s_bannerUntil = 0;
 
 // ---- design tokens ---------------------------------------------------------
 // Restrained palette — one neutral ground, one accent, one danger. Nothing
@@ -222,30 +228,20 @@ static void buildHomeTab(lv_obj_t* tab) {
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
 
-    // LED indicator (a filled circle we recolour)
-    s_ledDot = lv_obj_create(tab);
-    lv_obj_remove_style_all(s_ledDot);
-    lv_obj_set_size(s_ledDot, 64, 64);
-    lv_obj_align(s_ledDot, LV_ALIGN_TOP_LEFT, 0, 4);
-    lv_obj_set_style_radius(s_ledDot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(s_ledDot, lvhex(s_ledColor), 0);
-    lv_obj_set_style_bg_opa(s_ledDot, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_ledDot, 2, 0);
-    lv_obj_set_style_border_color(s_ledDot, lvhex(C_LINE), 0);
-    lv_obj_clear_flag(s_ledDot, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Status + battery
+    // Status + battery. The animated LED "circle that turns colors while a
+    // script runs" is gone — status label carries the same information as
+    // text, without a repainting circle on every LVGL tick.
     s_statusLbl = lv_label_create(tab);
     lv_label_set_text(s_statusLbl, "Booting...");
     lv_obj_set_style_text_color(s_statusLbl, lvhex(C_TEXT), 0);
     lv_obj_set_style_text_font(s_statusLbl, &lv_font_montserrat_22, 0);
-    lv_obj_align(s_statusLbl, LV_ALIGN_TOP_LEFT, 80, 6);
+    lv_obj_align(s_statusLbl, LV_ALIGN_TOP_LEFT, 0, 6);
 
     s_battLbl = lv_label_create(tab);
     lv_label_set_text(s_battLbl, LV_SYMBOL_BATTERY_FULL " -- %");
     lv_obj_set_style_text_color(s_battLbl, lvhex(C_MUTED), 0);
     lv_obj_set_style_text_font(s_battLbl, &lv_font_montserrat_16, 0);
-    lv_obj_align(s_battLbl, LV_ALIGN_TOP_LEFT, 80, 40);
+    lv_obj_align(s_battLbl, LV_ALIGN_TOP_RIGHT, 0, 8);
 
     // Script + progress
     s_scriptLbl = lv_label_create(tab);
@@ -302,6 +298,22 @@ static void buildHomeTab(lv_obj_t* tab) {
     lv_obj_set_style_text_font(s_clientsLbl, &lv_font_montserrat_16, 0);
     lv_obj_align(s_clientsLbl, LV_ALIGN_TOP_LEFT, 0, 80);
 
+    // Banner overlay sits between the AP card and the STOP button. Used for
+    // transient system events (SD inserted/removed, power-off countdown).
+    s_bannerLbl = lv_label_create(tab);
+    lv_obj_set_style_text_color(s_bannerLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_bannerLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_bg_color(s_bannerLbl, lvhex(C_LINE), 0);
+    lv_obj_set_style_bg_opa(s_bannerLbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_bannerLbl, 10, 0);
+    lv_obj_set_style_radius(s_bannerLbl, 8, 0);
+    lv_obj_set_width(s_bannerLbl, LCD_W - 40);
+    lv_obj_set_style_text_align(s_bannerLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_bannerLbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_bannerLbl, "");
+    lv_obj_align(s_bannerLbl, LV_ALIGN_BOTTOM_MID, 0, -170);
+    lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+
     // Toast overlay (hidden until watchUiFlash). Bug #22: sit ABOVE the STOP
     // button (74 tall, bottom -10) with generous space above so the toast
     // doesn't get clipped by tall multi-line messages either.
@@ -333,6 +345,62 @@ static void buildHomeTab(lv_obj_t* tab) {
     lv_obj_center(stopLbl);
 }
 
+// ---- Files tab -------------------------------------------------------------
+// Rows are [ name (grows) | ▶ green | 🗑 red ]. Callbacks record the intent
+// on s_pendingAction; the main loop consumes it and runs the actual SD /
+// interpreter work off the LVGL task.
+static void filesRunCb(lv_event_t* e) {
+    const char* name = (const char*)lv_event_get_user_data(e);
+    if (!name) return;
+    s_pendingAction.has_run = true;
+    strncpy(s_pendingAction.run_name, name, sizeof(s_pendingAction.run_name) - 1);
+    s_pendingAction.run_name[sizeof(s_pendingAction.run_name) - 1] = '\0';
+}
+static void filesDelCb(lv_event_t* e) {
+    const char* name = (const char*)lv_event_get_user_data(e);
+    if (!name) return;
+    s_pendingAction.has_delete = true;
+    strncpy(s_pendingAction.delete_name, name, sizeof(s_pendingAction.delete_name) - 1);
+    s_pendingAction.delete_name[sizeof(s_pendingAction.delete_name) - 1] = '\0';
+}
+
+static void buildFilesTab(lv_obj_t* tab) {
+    lv_obj_set_style_bg_color(tab, lvhex(C_BG), 0);
+    lv_obj_set_style_pad_all(tab, 0, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
+
+    s_filesList = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_filesList);
+    lv_obj_set_size(s_filesList, LCD_W, LV_PCT(100));
+    lv_obj_set_style_pad_all(s_filesList, 0, 0);
+    lv_obj_set_style_bg_color(s_filesList, lvhex(C_BG), 0);
+    lv_obj_set_flex_flow(s_filesList, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_filesList, LV_FLEX_ALIGN_START,
+                                       LV_FLEX_ALIGN_START,
+                                       LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(s_filesList, LV_DIR_VER);
+    lv_obj_set_style_pad_gap(s_filesList, 0, 0);
+    lv_obj_set_scrollbar_mode(s_filesList, LV_SCROLLBAR_MODE_OFF);
+
+    s_filesEmpty = lv_label_create(tab);
+    lv_label_set_text(s_filesEmpty,
+        LV_SYMBOL_FILE "  No scripts yet\n"
+        "Drop .txt files in /scripts on the SD card.");
+    lv_obj_set_style_text_color(s_filesEmpty, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(s_filesEmpty, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(s_filesEmpty, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_filesEmpty, LCD_W - 40);
+    lv_label_set_long_mode(s_filesEmpty, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_filesEmpty, LV_ALIGN_CENTER, 0, 0);
+}
+
+// Store row-name strings so callbacks can point at stable memory across
+// rebuilds. LVGL user_data is a raw pointer, so we can't hand it a String
+// stack copy — this vector outlives each row until the next rebuild frees it.
+static std::vector<std::string> s_fileRowNames;
+
+// ---- settings tab ---------------------------------------------------------
 static void buildSettingsTab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, lvhex(C_BG), 0);
     lv_obj_set_style_pad_all(tab, 0, 0);
@@ -361,7 +429,9 @@ static void buildSettingsTab(lv_obj_t* tab) {
     // shim compile-compat. Firmware reports hidden_settings=["led"] via
     // /api/stats so the web UI can hide its toggle too.
     // makeSwitchRow(tab, LV_SYMBOL_POWER, "Status LED", true, settingSwitchCb, SET_LED);
-    makeSwitchRow(tab, LV_SYMBOL_EYE_CLOSE, "Silent startup",  true, settingSwitchCb, SET_SILENT);
+    // Silent startup off by default — a fresh flash should show the wearer
+    // that USB HID is up, not hide it. Users can still opt in.
+    makeSwitchRow(tab, LV_SYMBOL_EYE_CLOSE, "Silent startup",  false, settingSwitchCb, SET_SILENT);
     makeSwitchRow(tab, LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
     makeSwitchRow(tab, LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
 
@@ -418,12 +488,29 @@ void watchUiBegin() {
     lv_obj_set_style_border_side (tabBar, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_width(tabBar, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
     lv_obj_set_style_border_color(tabBar, lvhex(C_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
+    // "Settings tab stretched like italic font" fix: LVGL's default theme
+    // applies transform_scale/transform_zoom to the checked and pressed
+    // tab-button states — the whole button (icon + label) rubber-bands wider
+    // for a beat when selected. Pin scale to 100% in every state.
+    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS);
+    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS);
+    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale_x(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED | LV_STATE_PRESSED);
+    lv_obj_set_style_transform_scale_y(tabBar, 256, LV_PART_ITEMS | LV_STATE_CHECKED | LV_STATE_PRESSED);
     // Disable tab-switch slide animation — feels laggy on QSPI AMOLED.
     lv_obj_set_style_anim_duration(tv, 0, 0);
+    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS);
+    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_anim_duration(tabBar, 0, LV_PART_ITEMS | LV_STATE_PRESSED);
 
-    s_tabHome = lv_tabview_add_tab(tv, LV_SYMBOL_HOME     "  Home");
-    s_tabSet  = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS "  Settings");
+    s_tabHome  = lv_tabview_add_tab(tv, LV_SYMBOL_HOME     "  Home");
+    s_tabFiles = lv_tabview_add_tab(tv, LV_SYMBOL_FILE     "  Files");
+    s_tabSet   = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS "  Settings");
     buildHomeTab(s_tabHome);
+    buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
     Serial.println("[WatchUI] Ready");
@@ -447,22 +534,18 @@ void watchUiTick() {
     s_lastHandler = now;
     lv_task_handler();
 
-    // LED dot — change-detect so we don't rewrite the same colour every tick.
-    if (s_ledDot) {
-        static uint32_t sLastShown = 0xFFFFFFFFu;
-        uint32_t desired;
-        if (s_blinkMs == 0) {
-            desired = s_ledColor;
-        } else {
-            if (now - s_lastBlinkTick >= s_blinkMs) {
-                s_lastBlinkTick = now;
-                s_blinkOn = !s_blinkOn;
-            }
-            desired = s_blinkOn ? s_ledColor : C_LED_OFF;
-        }
-        if (desired != sLastShown) {
-            sLastShown = desired;
-            lv_obj_set_style_bg_color(s_ledDot, lvhex(desired), 0);
+    // LED dot removed from the home tab — the status label carries the same
+    // information as text without a repainting circle every tick. Keep the
+    // colour state around so callers (LEDManager watchUiSetLed) still compile.
+    (void)s_blinkMs;
+    (void)s_lastBlinkTick;
+    (void)s_blinkOn;
+
+    // Banner timeout
+    if (s_bannerLbl && !(lv_obj_has_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN))) {
+        if (s_bannerUntil && now > s_bannerUntil) {
+            lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+            s_bannerUntil = 0;
         }
     }
 
@@ -592,6 +675,98 @@ WatchUiPendingSettings watchUiConsumePendingSettings() {
     WatchUiPendingSettings p = s_pending;
     s_pending = WatchUiPendingSettings{};
     return p;
+}
+
+WatchUiPendingScriptAction watchUiConsumePendingScriptAction() {
+    WatchUiPendingScriptAction p = s_pendingAction;
+    s_pendingAction = WatchUiPendingScriptAction{};
+    return p;
+}
+
+void watchUiSetBanner(const char* text, uint32_t rgb) {
+    if (!s_bannerLbl) return;
+    if (!text || !*text) {
+        lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+        s_bannerUntil = 0;
+        return;
+    }
+    lv_label_set_text(s_bannerLbl, text);
+    lv_obj_set_style_bg_color(s_bannerLbl, lvhex(rgb), 0);
+    lv_obj_clear_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
+    // 4-second banner; call watchUiSetBanner(nullptr) to clear early.
+    s_bannerUntil = millis() + 4000;
+}
+
+void watchUiSetFileList(const std::vector<String>& names) {
+    if (!s_filesList || !s_filesEmpty) return;
+    // Wipe existing rows. LVGL frees the child widgets; the user_data we set
+    // on each button points at std::string entries in s_fileRowNames, so we
+    // clear the LVGL tree BEFORE mutating the vector so no callback fires
+    // against a freed pointer.
+    lv_obj_clean(s_filesList);
+    s_fileRowNames.clear();
+    s_fileRowNames.reserve(names.size());
+
+    if (names.empty()) {
+        lv_obj_clear_flag(s_filesEmpty, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_add_flag(s_filesEmpty, LV_OBJ_FLAG_HIDDEN);
+
+    for (const String& n : names) {
+        s_fileRowNames.emplace_back(n.c_str());
+        const char* nameCstr = s_fileRowNames.back().c_str();
+
+        lv_obj_t* row = lv_obj_create(s_filesList);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, LCD_W, 68);
+        lv_obj_set_style_pad_hor(row, 12, 0);
+        lv_obj_set_style_pad_ver(row, 8, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, lvhex(C_LINE), 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                   LV_FLEX_ALIGN_CENTER,
+                                   LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_STATE_PRESSED);
+
+        lv_obj_t* lbl = lv_label_create(row);
+        lv_label_set_text(lbl, nameCstr);
+        lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_flex_grow(lbl, 1);
+        lv_obj_set_style_pad_right(lbl, 8, 0);
+
+        // ▶ Run — green square
+        lv_obj_t* runBtn = lv_btn_create(row);
+        lv_obj_set_size(runBtn, 52, 52);
+        lv_obj_set_style_bg_color(runBtn, lvhex(C_OK), 0);
+        lv_obj_set_style_radius(runBtn, 8, 0);
+        lv_obj_set_style_shadow_width(runBtn, 0, 0);
+        lv_obj_add_event_cb(runBtn, filesRunCb, LV_EVENT_CLICKED, (void*)nameCstr);
+        lv_obj_t* runLbl = lv_label_create(runBtn);
+        lv_label_set_text(runLbl, LV_SYMBOL_PLAY);
+        lv_obj_set_style_text_color(runLbl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(runLbl, &lv_font_montserrat_22, 0);
+        lv_obj_center(runLbl);
+
+        // 🗑 Delete — red square, rightmost
+        lv_obj_t* delBtn = lv_btn_create(row);
+        lv_obj_set_size(delBtn, 52, 52);
+        lv_obj_set_style_bg_color(delBtn, lvhex(C_DANGER), 0);
+        lv_obj_set_style_radius(delBtn, 8, 0);
+        lv_obj_set_style_shadow_width(delBtn, 0, 0);
+        lv_obj_set_style_margin_left(delBtn, 8, 0);
+        lv_obj_add_event_cb(delBtn, filesDelCb, LV_EVENT_CLICKED, (void*)nameCstr);
+        lv_obj_t* delLbl = lv_label_create(delBtn);
+        lv_label_set_text(delLbl, LV_SYMBOL_TRASH);
+        lv_obj_set_style_text_color(delLbl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(delLbl, &lv_font_montserrat_22, 0);
+        lv_obj_center(delLbl);
+    }
 }
 
 // Sync switches without firing our event handler (would re-queue a pending

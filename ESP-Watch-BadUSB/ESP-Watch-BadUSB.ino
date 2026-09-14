@@ -593,6 +593,8 @@ void setup() {
 
   loadAvailableScripts();
   logDebug("Scripts loaded: " + String(availableScripts.size()));
+  // Feed the initial list into the watch UI's Files tab.
+  watchUiSetFileList(availableScripts);
 
   if (!loadLanguage(currentLanguage)) {
     Serial.println("Failed to load default language, trying 'us'");
@@ -970,6 +972,40 @@ void loop() {
     }
   }
 
+  // Files-tab action bridge: run/delete requests queued from the watch UI
+  // execute on the main task so they don't tie up LVGL.
+  {
+    WatchUiPendingScriptAction pa = watchUiConsumePendingScriptAction();
+    if (pa.has_run) {
+      if (scriptRunning) {
+        watchUiFlash("A script is already running");
+      } else if (!sdCardPresent) {
+        watchUiFlash("No SD card");
+      } else {
+        String script = loadScript(String(pa.run_name));
+        if (script.length() == 0) {
+          watchUiFlash("Script empty or missing");
+        } else {
+          watchUiFlash((String("Running ") + pa.run_name).c_str());
+          // Defer execution one tick so the toast paints first.
+          pendingScript = script;
+          pendingScriptReady = true;
+        }
+      }
+    }
+    if (pa.has_delete) {
+      if (scriptRunning) {
+        watchUiFlash("Can't delete while running");
+      } else if (deleteScript(String(pa.delete_name))) {
+        watchUiFlash((String("Deleted ") + pa.delete_name).c_str());
+        loadAvailableScripts();
+        watchUiSetFileList(availableScripts);
+      } else {
+        watchUiFlash("Delete failed");
+      }
+    }
+  }
+
   // Cheap status/clients pull — 4 Hz is fine for a human-facing readout.
   {
     static unsigned long lastUi = 0;
@@ -982,6 +1018,14 @@ void loop() {
       else if (scriptRunning)    st = "Script running";
       watchUiSetStatus(st);
       watchUiSetScript(scriptRunning ? "web script" : "");
+      // Refresh the Files tab when the SD script list changed (web upload
+      // /delete, boot script edit). Cheap size-compare guard so we don't
+      // rebuild every 250 ms.
+      static size_t lastScriptCount = (size_t)-1;
+      if (availableScripts.size() != lastScriptCount) {
+        lastScriptCount = availableScripts.size();
+        watchUiSetFileList(availableScripts);
+      }
     }
   }
 
@@ -1001,7 +1045,23 @@ void loop() {
 
   if (millis() - lastSDCheck >= SD_CHECK_INTERVAL) {
     lastSDCheck = millis();
+    // Watch port: detect SD hot-plug edges so the UI can react. checkSDCard()
+    // updates sdCardPresent; compare against the previous value and show a
+    // banner + refresh the Files tab whenever it changes.
+    static bool lastSdPresent = sdCardPresent;
     checkSDCard();
+    if (sdCardPresent != lastSdPresent) {
+      lastSdPresent = sdCardPresent;
+      if (sdCardPresent) {
+        watchUiSetBanner(LV_SYMBOL_SD_CARD "  SD card inserted", 0x2A5A2A);
+        loadAvailableScripts();
+        watchUiSetFileList(availableScripts);
+      } else {
+        watchUiSetBanner(LV_SYMBOL_WARNING "  SD card removed", 0x5A2A2A);
+        availableScripts.clear();
+        watchUiSetFileList(availableScripts);
+      }
+    }
   }
 
   // v4.24: button polling moved to pumpButton() so WAIT_FOR_BUTTON_PRESS

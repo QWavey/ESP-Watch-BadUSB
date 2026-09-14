@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include <vector>
 
 void watchUiBegin();
 void watchUiTick();
@@ -20,6 +21,24 @@ void watchUiSetAP(const char* ssid, const char* password, const char* ip);
 void watchUiSetProgress(int percent);
 
 bool watchUiConsumeStopPressed();
+
+// ---- Files-tab bridge ----
+// The Files tab lists /scripts on the SD card. Tapping the green ▶ button on
+// a row queues a run action; tapping the red 🗑 queues a delete. The main
+// loop consumes these via watchUiConsumePendingScriptAction() so LVGL never
+// blocks on SD I/O.
+struct WatchUiPendingScriptAction {
+    bool has_run;      char run_name[64];
+    bool has_delete;   char delete_name[64];
+};
+WatchUiPendingScriptAction watchUiConsumePendingScriptAction();
+
+// Feed the list to the UI. Pass an ordered vector of script basenames.
+void watchUiSetFileList(const std::vector<String>& names);
+
+// Show a transient banner across the whole home tab: SD inserted / removed,
+// power-off countdown, etc. Pass nullptr to hide.
+void watchUiSetBanner(const char* text, uint32_t rgb = 0x2A2A30);
 
 // ---- settings-tab bridges ----
 struct WatchUiPendingSettings {
