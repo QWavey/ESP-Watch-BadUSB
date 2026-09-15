@@ -9,6 +9,9 @@
 #include <lvgl.h>
 #include <XPowersLib.h>
 #include <string>
+#include <Preferences.h>              // task #2: read clock_epoch/tz/sync_ms
+                                       // to render real time on show()
+extern Preferences preferences;
 
 // Global instances the extern declarations in those headers point at.
 ScreenClass  Screen;
@@ -395,6 +398,11 @@ static void buildFilesTab(lv_obj_t* tab) {
     s_filesList = lv_obj_create(tab);
     lv_obj_remove_style_all(s_filesList);
     lv_obj_set_size(s_filesList, LCD_W, LV_PCT(100));
+    // Task #4: scroll polish. LVGL 9 defaults to elastic snap + a scroll-
+    // end animation that on this QSPI AMOLED reads as lag. Kill both.
+    lv_obj_set_scroll_snap_x(s_filesList, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_scroll_snap_y(s_filesList, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_style_anim_duration(s_filesList, 0, LV_STATE_SCROLLED);
     // Curvy safe-area: leave a horizontal gutter so each row (also inset
     // now) sits inside the visible circle.
     lv_obj_set_style_pad_left(s_filesList, SAFE_X, 0);
@@ -440,6 +448,10 @@ static void buildSettingsTab(lv_obj_t* tab) {
                                LV_FLEX_ALIGN_START,
                                LV_FLEX_ALIGN_START);
     lv_obj_set_scroll_dir(tab, LV_DIR_VER);
+    // Task #4: no snap or scroll-end anim on the Settings scroll surface.
+    lv_obj_set_scroll_snap_x(tab, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_scroll_snap_y(tab, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_style_anim_duration(tab, 0, LV_STATE_SCROLLED);
     lv_obj_set_style_pad_gap(tab, 0, 0);
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);   // /improve: clean surface
 
@@ -546,6 +558,13 @@ void watchUiBegin() {
     }
     // Disable tab-switch slide animation — feels laggy on QSPI AMOLED.
     lv_obj_set_style_anim_duration(tv, 0, 0);
+    // Task #4: also disable scroll snap + scroll-end anim on the tabview
+    // and its content container so page drag follows the finger 1:1.
+    lv_obj_set_scroll_snap_x(tv, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_scroll_snap_y(tv, LV_SCROLL_SNAP_NONE);
+    lv_obj_set_style_anim_duration(tv, 0, LV_STATE_SCROLLED);
+    // Settings tab scrolls vertically; polish it too.
+    // (Done below after s_tabSet is bound.)
 
     // Swipe-up on the tabview brings the clock back. LVGL emits a
     // LV_EVENT_GESTURE with LV_DIR_TOP when the user drags upward.
@@ -612,6 +631,12 @@ void watchUiBegin() {
 }
 
 // ---- Clock overlay ---------------------------------------------------------
+// Cached last-rendered clock text — file-scope so watchUiShowClock() can
+// invalidate it when the clock overlay is re-created (otherwise the
+// change-detect in watchUiSetClockSeconds skips the first-frame paint
+// and the wearer sees "00:00" for a beat before the next tick fires).
+static char s_lastClockText[8] = "";
+
 static void clockGestureCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
@@ -628,6 +653,11 @@ void watchUiShowClock() {
         lv_obj_clear_flag(s_clockRoot, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    // Task #2: brand-new s_clockTime is coming in below with text "00:00".
+    // Invalidate the change-detect cache so the first watchUiSetClock-
+    // Seconds() call below actually updates the label instead of skipping
+    // as an "unchanged" write.
+    s_lastClockText[0] = '\0';
     s_clockRoot = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(s_clockRoot);
     lv_obj_set_size(s_clockRoot, LCD_W, LCD_H);
@@ -658,6 +688,26 @@ void watchUiShowClock() {
     lv_obj_center(s_clockTime);
     // Hint text removed per user request — clock face stays clean.
     s_clockHint = nullptr;
+
+    // Task #2: kill the "00:00 for a beat when I swipe up twice" flash.
+    // Previously the label was created with placeholder text "00:00" and
+    // the next 1 Hz tick in the .ino updated it — that's a full second of
+    // wrong time visible. Compute the current time here from the persisted
+    // NVS clock and paint it before the LVGL redraw so the FIRST frame
+    // the wearer sees is the right HH:MM.
+    {
+        uint64_t syncEpoch = preferences.getULong64("clock_epoch",   0);
+        int32_t  tz        = preferences.getLong   ("clock_tz_secs", 0);
+        uint32_t syncMs    = preferences.getULong  ("clock_sync_ms", 0);
+        uint64_t nowSecs;
+        if (syncEpoch >= 1700000000ULL) {
+            uint32_t elapsedMs = millis() - syncMs;
+            nowSecs = syncEpoch + (elapsedMs / 1000) + tz;
+        } else {
+            nowSecs = millis() / 1000;
+        }
+        watchUiSetClockSeconds((uint32_t)(nowSecs & 0xFFFFFFFFULL));
+    }
 }
 
 void watchUiHideClock() {
@@ -674,15 +724,13 @@ bool watchUiClockVisible() {
 
 void watchUiSetClockSeconds(uint32_t seconds) {
     if (!s_clockTime) return;
-    // `seconds` is the caller's chosen time source (real epoch when we
-    // have one, uptime otherwise). Render as HH:MM mod 24 h.
     uint32_t h = (seconds / 3600) % 24;
     uint32_t m = (seconds / 60) % 60;
-    static char last[8] = "";
     char buf[8];
     snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)h, (unsigned)m);
-    if (strcmp(last, buf) == 0) return;
-    strncpy(last, buf, sizeof(last));
+    if (strcmp(s_lastClockText, buf) == 0) return;
+    strncpy(s_lastClockText, buf, sizeof(s_lastClockText));
+    s_lastClockText[sizeof(s_lastClockText) - 1] = '\0';
     lv_label_set_text(s_clockTime, buf);
 }
 
@@ -998,14 +1046,24 @@ void watchUiSetFileList(const std::vector<String>& names,
         lv_label_set_text(lbl, nameCstr);
         lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
-        // Same anti-stretch discipline as the clock label — pin transform
-        // scale + letter spacing on the row label so a theme-driven
-        // transform can't rubber-band it wider than the file name needs.
         lv_obj_set_style_transform_scale_x(lbl, 256, 0);
         lv_obj_set_style_transform_scale_y(lbl, 256, 0);
         lv_obj_set_style_text_letter_space(lbl, 0, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_flex_grow(lbl, 1);
+        // Task #3: EXPLICIT width instead of flex_grow. flex_grow made the
+        // label bounce between its content-size and remaining-space size
+        // for a frame on every setFileList rebuild — visible as horizontal
+        // stretch. Fixed width takes it out of the layout dance entirely.
+        //   Row inner = (LCD_W - 2*SAFE_X) - 2*hpad_8 = 410 - 48 - 16 = 346
+        //   Actions   = 3 buttons × 52 px + 2 gaps × 6 = 168 px
+        //   Trailing gap after label                    = 8 px
+        //   Label width = 346 - 168 - 8                 = 170 px
+        // Recompute if any of those constants (SAFE_X, button size, gap)
+        // change.
+        const int rowInner = (LCD_W - 2 * SAFE_X) - 2 * 8;
+        const int actionsW = 3 * 52 + 2 * 6;
+        const int labelW   = rowInner - actionsW - 8;
+        lv_obj_set_width(lbl, labelW);
         lv_obj_set_style_pad_right(lbl, 8, 0);
 
         bool isAutostart = (autostartName.length() > 0 &&

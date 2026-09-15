@@ -63,6 +63,11 @@ static void applySilentAtLowestLevel() {
 // PHY drives D+/D- naturally again.
 void silentRestorePadsForUsb() {
   usb_serial_jtag_ll_phy_disable_pull_override();
+  // Task #1: paired with the phy_enable_pad(false) in usbBeginSilent —
+  // bring the FSLS PHY pads back online so a later USB.begin() / hidAttach
+  // actually drives D+/D-. Cheap re-enable that only matters after a
+  // silent boot; a normal boot never disabled it.
+  usb_serial_jtag_ll_phy_enable_pad(true);
 }
 
 // Kept for callers that used the older name; both API surfaces work.
@@ -136,11 +141,18 @@ void hidReleaseIfSilent() {
 // from before this ran — a clean replug after the first-ever silent boot
 // should show nothing at all.
 void usbBeginSilent() {
-  // Same pull-up override the constructor does. We do NOT disable the PHY
-  // pads: killing pads leaves TinyUSB in a state where enumeration works but
-  // tud_hid_ready() returns false forever (no reports go through), which was
-  // the "attaches but doesn't type" bug the user hit.
+  // Same pull-up override the constructor does — tells the host "no device".
   applySilentAtLowestLevel();
+  // User report (task #1): silent-startup unit still enumerated as a JTAG
+  // device in flash mode. The ROM's USB-Serial/JTAG PHY is a SECOND USB
+  // path on the S3 that the pull-up override alone does NOT gate; the PHY
+  // pads keep driving D+/D-. Powering the FSLS pads down here makes the
+  // pins go Hi-Z, so the host sees literally nothing — no CDC, no JTAG.
+  //   Trade-off: ensureHidReady() must re-enable the pads before USB.begin()
+  //   or later HID attach won't work. We do that below in the "first-ever
+  //   use in silent mode" path via silentRestorePadsForUsb() + a paired
+  //   usb_serial_jtag_ll_phy_enable_pad(true) call.
+  usb_serial_jtag_ll_phy_enable_pad(false);
   usbStarted   = false;    // TinyUSB will be initialised on first ensureHidReady()
   hidConnected = false;
 }
