@@ -626,9 +626,15 @@ void watchUiShowClock() {
     lv_label_set_text(s_clockTime, "00:00");
     lv_obj_set_style_text_color(s_clockTime, lv_color_white(), 0);
     lv_obj_set_style_text_font(s_clockTime, &lv_font_montserrat_48, 0);
-    // Pin transform + letter spacing on the clock label itself so it can't
-    // inherit any theme-applied stretch. Same discipline as the tab-button
-    // fix — belt and braces.
+    // "Clock stretches as time goes up" fix: LV_SIZE_CONTENT (the default)
+    // makes the label re-flow to fit each new HH:MM string. Every rewrite
+    // triggers a layout pass that briefly enlarges/shrinks the widget's
+    // bounding box — visible as horizontal stretch. Pin an explicit width
+    // that fits the widest possible HH:MM ("00:00"-"23:59") and center
+    // text INSIDE that fixed frame. Height also fixed so vertical layout
+    // doesn't dance either.
+    lv_obj_set_size(s_clockTime, LCD_W - 40, 80);
+    lv_obj_set_style_text_align(s_clockTime, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_transform_scale_x(s_clockTime, 256, 0);
     lv_obj_set_style_transform_scale_y(s_clockTime, 256, 0);
     lv_obj_set_style_text_letter_space(s_clockTime, 0, 0);
@@ -966,6 +972,12 @@ void watchUiSetFileList(const std::vector<String>& names,
         lv_label_set_text(lbl, nameCstr);
         lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
+        // Same anti-stretch discipline as the clock label — pin transform
+        // scale + letter spacing on the row label so a theme-driven
+        // transform can't rubber-band it wider than the file name needs.
+        lv_obj_set_style_transform_scale_x(lbl, 256, 0);
+        lv_obj_set_style_transform_scale_y(lbl, 256, 0);
+        lv_obj_set_style_text_letter_space(lbl, 0, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
         lv_obj_set_flex_grow(lbl, 1);
         lv_obj_set_style_pad_right(lbl, 8, 0);
