@@ -3803,22 +3803,21 @@ async function toggleDeadnet() {
     const sw = document.getElementById('dnToggle');
     if (!sw) return;
     const wantOn = sw.checked;
-    // Gate: DeadNet targets WIRED LAN (Ethernet). Not the WiFi network
-    // the watch might be joined to. If the wired driver isn't up (which
-    // today it never is — USB Host + Ethernet-adapter driver is not yet
-    // implemented on this firmware), refuse and explain.
+    // Gate: DeadNet needs the ESP joined to a WiFi network (STA). The
+    // LAN we're attacking is the one behind that AP.
     const lan = await fetch('/api/lan/status').then(r => r.json()).catch(() => null);
     if (wantOn && (!lan || !lan.connected)) {
-        const why = (lan && lan.reason) || 'wired Ethernet not connected';
+        const why = (lan && lan.reason) || 'not joined to any WiFi';
         alert('Cannot start DeadNet — ' + why + '.\n\n' +
-              'DeadNet attacks the WIRED LAN (like the flashnuke deadnet_lan_kill payload against eth1). ' +
-              'That needs USB Host mode + an Ethernet-adapter driver (RTL8153/CDC-ECM) — those are not shipping in this build yet. ' +
-              'Attaching a USB-C-to-Ethernet adapter WILL NOT work until that driver lands.');
+              'Join a WiFi under "Internet Connection" first, then try again.');
         sw.checked = false;
         return;
     }
     const url = wantOn ? '/api/dead/start' : '/api/dead/stop';
-    const body = wantOn ? JSON.stringify({mode: dnReadMask()}) : '{}';
+    const risky = !!document.getElementById('dnRisky')?.checked;
+    const body = wantOn
+        ? JSON.stringify({mode: dnReadMask(), risky})
+        : '{}';
     try {
         const r = await fetch(url, {
             method: 'POST',

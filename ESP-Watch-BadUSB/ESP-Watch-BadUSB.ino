@@ -1248,13 +1248,13 @@ void loop() {
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (pe.has_deadnet) {
-      // Watch-side DeadNet toggle. Gate on WIRED Ethernet link up. The
-      // USB Host + Ethernet-adapter driver isn't implemented yet, so
-      // this always trips the "no link" branch today.
-      bool wiredUp = false;   // TODO: real ETH.linkUp() once driver ships
+      // Watch-side DeadNet toggle. Gate on WiFi STA connected (the LAN
+      // is the network we joined via WiFi). AMOLED start is always ARP
+      // only — the risky modes (DEAUTH, SNIFF) need explicit opt-in via
+      // the web dashboard which can show the warning first.
       if (pe.deadnet_on) {
-        if (!wiredUp) {
-          watchUiFlash("DeadNet: wired Ethernet not connected");
+        if (WiFi.status() != WL_CONNECTED) {
+          watchUiFlash("DeadNet: not joined to any WiFi");
           watchUiSetDeadnetToggle(false);
         } else if (g_deadnet.startAttack(ATTACK_MODE_ARP)) {
           // "Everything off except WiFi" - detach USB HID/MSC + stop BT.
@@ -1282,11 +1282,8 @@ void loop() {
     static unsigned long lastLanPoll = 0;
     if (millis() - lastLanPoll >= 1000) {
       lastLanPoll = millis();
-      // WIRED LAN status (Ethernet adapter over USB Host). Always down
-      // today; keep the label honest so the wearer doesn't think a
-      // WiFi STA connection would qualify.
-      bool wiredUp = false;   // TODO: real ETH.linkUp() once driver ships
-      watchUiSetLanConnected(wiredUp, wiredUp ? "link up" : "no wired link");
+      bool staUp = (WiFi.status() == WL_CONNECTED);
+      watchUiSetLanConnected(staUp, staUp ? WiFi.SSID().c_str() : "not joined");
       watchUiSetDeadnetToggle(g_deadnet.isRunning());
     }
   }

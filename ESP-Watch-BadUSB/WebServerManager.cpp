@@ -728,46 +728,42 @@ $('#go').addEventListener('click', async () => {
   });
 
   // ---- LAN / DeadNet API endpoints --------------------------------------
-  // Corrected model per user feedback: LAN = WIRED Ethernet (like the
-  // flashnuke deadnet_lan_kill payload does over eth1). The current Watch
-  // firmware has NO wired Ethernet — the S3's USB PHY is in device mode
-  // and there's no USB Host + CDC-ECM/RTL8153 driver wired up yet. So
-  // wiredLanUp() returns false today; the UI surfaces that honestly and
-  // DeadNet's start endpoint refuses to run until the driver lands.
+  // Reverted the "wired-only" gate (the Waveshare 2.06" board doesn't have
+  // an OTG boost on VBUS, so wired-USB-Ethernet was never going to happen
+  // on this hardware anyway). DeadNet now targets the LAN the watch is
+  // joined to via WiFi STA — same design as the flashnuke original — and
+  // /api/lan/status reports STA link.
   //
-  // When USB Host + Ethernet adapter driver is added later this stub
-  // becomes a real link-state check on the ETH interface.
-  auto wiredLanUp = [](void) -> bool {
-    // TODO: replace with real ETH.linkUp() once USB Host + RTL8153 driver
-    // lands. Currently always false because the S3's USB stays in device
-    // mode presenting HID+MSC+CDC and can't drive an Ethernet adapter.
-    return false;
-  };
+  // Modes that cost dashboard uptime are refused unless the caller
+  // explicitly acknowledges: DEAUTH sends management frames on the shared
+  // channel and can knock the dashboard's own AP clients loose; SNIFF
+  // flips the whole radio into promiscuous, so TCP through our AP takes
+  // heavy latency hits. Both need ?risky=1 on the start call.
 
-  server.on("/api/lan/status", [wiredLanUp]() {
+  server.on("/api/lan/status", []() {
     DynamicJsonDocument doc(256);
-    bool up = wiredLanUp();
+    bool up = (WiFi.status() == WL_CONNECTED);
     doc["connected"]      = up;
-    doc["driverPresent"]  = false;   // true once USB Host + adapter driver ships
-    doc["reason"]         = up ? "" : "wired Ethernet unavailable — USB Host + adapter driver not yet implemented";
-    // Legacy hint the web JS also reads: pass the WiFi-STA status so the
-    // Internet-Connection card can still show whether the ESP is joined
-    // to a WiFi (for other uses; NOT for DeadNet).
-    doc["staWifiConnected"] = (WiFi.status() == WL_CONNECTED);
-    if (WiFi.status() == WL_CONNECTED) {
-      doc["staSsid"]    = WiFi.SSID();
-      doc["staIp"]      = WiFi.localIP().toString();
+    doc["driverPresent"]  = true;    // WiFi STA is our LAN link now
+    doc["reason"]         = up ? "" : "not joined to any WiFi (Internet Connection above)";
+    doc["staWifiConnected"] = up;
+    if (up) {
+      doc["ssid"]           = WiFi.SSID();
+      doc["ip"]             = WiFi.localIP().toString();
+      doc["gateway"]        = WiFi.gatewayIP().toString();
+      doc["rssi"]           = WiFi.RSSI();
+      doc["staSsid"]        = WiFi.SSID();
+      doc["staIp"]          = WiFi.localIP().toString();
     }
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
 
-  server.on("/api/dead/start", HTTP_POST, [wiredLanUp]() {
-    // Gate: DeadNet targets WIRED LAN (eth), not the WiFi the watch is
-    // joined to. Without wired Ethernet the attack has nowhere to go.
-    if (!wiredLanUp()) {
+  server.on("/api/dead/start", HTTP_POST, []() {
+    // Gate: DeadNet targets the LAN the watch is joined to via WiFi STA.
+    if (WiFi.status() != WL_CONNECTED) {
       server.send(409, "application/json",
-        "{\"ok\":false,\"error\":\"wired Ethernet not connected — USB Host + adapter driver not yet implemented\"}");
+        "{\"ok\":false,\"error\":\"not joined to any WiFi — pick a network under Internet Connection first\"}");
       return;
     }
     String body = server.arg("plain");
@@ -777,16 +773,27 @@ $('#go').addEventListener('click', async () => {
       return;
     }
     uint8_t mode = doc["mode"] | ATTACK_MODE_ARP;
-    // Bug-hunt #3: ATTACK_MODE_DNS binds UDP:53. The captive-portal DNS
-    // owns port 53 in AP mode, so the bind silently fails and the DNS
-    // spoof task self-deletes with only a Serial log. Warn the caller
-    // rather than pretending DNS is arming — this matches the actual
-    // behaviour without silently masking user intent.
+    bool  risky = doc["risky"] | false;
+    // Fence off modes that break dashboard uptime unless the caller
+    // explicitly opts in with risky=true. This matches the honest
+    // engineering read: ARP + RA are safe to run alongside the AP
+    // (STA-side data traffic, no radio-state change). DEAUTH sends
+    // management frames on the shared channel — real risk of knocking
+    // dashboard clients loose. SNIFF flips the entire radio into
+    // promiscuous mode, so TCP through our AP takes heavy latency
+    // hits. DNS silently doesn't run (port 53 held by captive DNS,
+    // documented at bug-hunt #3).
+    uint8_t risky_bits = ATTACK_MODE_DEAUTH | ATTACK_MODE_SNIFF;
+    if ((mode & risky_bits) && !risky) {
+      String bad;
+      if (mode & ATTACK_MODE_DEAUTH) bad += "DEAUTH ";
+      if (mode & ATTACK_MODE_SNIFF)  bad += "SNIFF ";
+      String err = String("{\"ok\":false,\"error\":\"mode(s) ") + bad +
+                   String("degrade dashboard uptime — call again with risky:true to acknowledge\"}");
+      server.send(409, "application/json", err);
+      return;
+    }
     if (mode & ATTACK_MODE_DNS) {
-      // captivePortalUp is file-static in WiFiManager.cpp; the fact that
-      // we ARE in AP mode with our own captive DNS is a firmware-wide
-      // invariant, so we can safely assume port 53 is held. Warn once
-      // per start so it's obvious in Serial that DNS spoof will not run.
       Serial.println("[/api/dead/start] ATTACK_MODE_DNS requested but the firmware's captive DNS holds port 53 — DNS spoof task will fail to bind and self-exit");
     }
     std::vector<IPAddress> targets;
