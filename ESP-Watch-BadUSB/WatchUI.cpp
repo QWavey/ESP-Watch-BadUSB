@@ -86,11 +86,14 @@ static const uint32_t C_LED_OFF   = 0x101010;
 
 static const int LCD_W = LCD_WIDTH;
 static const int LCD_H = LCD_HEIGHT;
-// Curvy AMOLED safe-area inset — the Waveshare 2.06" panel has ~50 px
-// rounded corners. Text drawn flush to any edge gets sliced. Every full-
-// width row now uses (LCD_W - 2*SAFE_X) so labels stay inside the visible
-// circle. Applied inside the tab content, not the tab bar.
-static const int SAFE_X = 24;
+// Curvy AMOLED safe-area — the Waveshare 2.06" panel has aggressive
+// rounded corners (~60 px radius at the top-left/right where the tab bar
+// draws). Text drawn flush to any edge gets sliced. Every full-width row
+// now uses (LCD_W - 2*SAFE_X). SAFE_TOP + SAFE_BOT keep the first/last
+// row of a paged Settings screen off the curved ends too.
+static const int SAFE_X   = 40;
+static const int SAFE_TOP = 12;
+static const int SAFE_BOT = 20;
 
 static lv_color_t lvhex(uint32_t rgb) { return lv_color_hex(rgb & 0xFFFFFF); }
 
@@ -438,67 +441,211 @@ static void buildFilesTab(lv_obj_t* tab) {
 static std::vector<std::string> s_fileRowNames;
 
 // ---- settings tab ---------------------------------------------------------
+// Paged Settings — 4 items per page, big font + big switches, gesture
+// switch (swipe UP = next page, swipe DOWN = previous). No scroll, no
+// anim; each page swap is a hide/show of a full-screen page container.
+// Three pages: Radios, Behaviour, Actions.
+#define SETTINGS_PAGE_COUNT 3
+static lv_obj_t* s_settingsPages[SETTINGS_PAGE_COUNT] = { nullptr };
+static lv_obj_t* s_settingsDots [SETTINGS_PAGE_COUNT] = { nullptr };
+static int       s_settingsPage = 0;
+static lv_obj_t* s_settingsPageIndicator = nullptr;
+
+static void settingsShowPage(int p) {
+    if (p < 0) p = 0;
+    if (p >= SETTINGS_PAGE_COUNT) p = SETTINGS_PAGE_COUNT - 1;
+    s_settingsPage = p;
+    for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
+        if (!s_settingsPages[i]) continue;
+        if (i == p) lv_obj_clear_flag(s_settingsPages[i], LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_add_flag  (s_settingsPages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
+        if (!s_settingsDots[i]) continue;
+        lv_obj_set_style_bg_color(s_settingsDots[i],
+            lvhex(i == p ? C_ACCENT : C_LINE), 0);
+    }
+}
+
+static void settingsGestureCb(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    if      (d == LV_DIR_TOP)    settingsShowPage(s_settingsPage + 1);
+    else if (d == LV_DIR_BOTTOM) settingsShowPage(s_settingsPage - 1);
+}
+
+// Big variant of the switch row for the paged Settings — Montserrat 22
+// label, 60x36 switch, generous padding. Reuses the pending-settings
+// callback + switch handle registration in s_settingSw[].
+static lv_obj_t* makeBigSwitchRow(lv_obj_t* parent, const char* icon,
+                                  const char* label, bool initial,
+                                  lv_event_cb_t cb, int idx) {
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 80);
+    lv_obj_set_scroll_dir(row, LV_DIR_NONE);
+    lv_obj_set_style_pad_hor(row, 16, 0);
+    lv_obj_set_style_pad_ver(row, 10, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, lvhex(C_LINE), 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER,
+                               LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_STATE_PRESSED);
+
+    lv_obj_t* ic = lv_label_create(row);
+    lv_label_set_text(ic, icon);
+    lv_obj_set_style_text_color(ic, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_pad_right(ic, 14, 0);
+    lv_obj_set_width(ic, 36);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_letter_space(lbl, 0, 0);
+    lv_obj_set_style_transform_scale_x(lbl, 256, 0);
+    lv_obj_set_style_transform_scale_y(lbl, 256, 0);
+    lv_obj_set_flex_grow(lbl, 1);
+
+    lv_obj_t* sw = lv_switch_create(row);
+    lv_obj_set_size(sw, 72, 42);
+    lv_obj_set_style_bg_color(sw, lvhex(C_LINE), 0);
+    lv_obj_set_style_bg_color(sw, lvhex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_anim_duration(sw, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_anim_duration(sw, 0, LV_PART_KNOB);
+    if (initial) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)idx);
+    if (idx >= 0 && idx < SET_COUNT) s_settingSw[idx] = sw;
+    return row;
+}
+
+static lv_obj_t* makeBigActionRow(lv_obj_t* parent, const char* icon,
+                                  const char* label, const char* btnText,
+                                  bool danger, lv_event_cb_t cb) {
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 88);
+    lv_obj_set_scroll_dir(row, LV_DIR_NONE);
+    lv_obj_set_style_pad_hor(row, 16, 0);
+    lv_obj_set_style_pad_ver(row, 12, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, lvhex(C_LINE), 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER,
+                               LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* ic = lv_label_create(row);
+    lv_label_set_text(ic, icon);
+    lv_obj_set_style_text_color(ic, lvhex(danger ? C_DANGER : C_MUTED), 0);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_pad_right(ic, 14, 0);
+    lv_obj_set_width(ic, 36);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_letter_space(lbl, 0, 0);
+    lv_obj_set_style_transform_scale_x(lbl, 256, 0);
+    lv_obj_set_style_transform_scale_y(lbl, 256, 0);
+    lv_obj_set_flex_grow(lbl, 1);
+
+    lv_obj_t* btn = lv_btn_create(row);
+    lv_obj_set_size(btn, 150, 54);
+    lv_obj_set_style_bg_color(btn, lvhex(danger ? C_DANGER : C_ACCENT), 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bt = lv_label_create(btn);
+    lv_label_set_text(bt, btnText);
+    lv_obj_set_style_text_color(bt, lv_color_white(), 0);
+    lv_obj_set_style_text_font(bt, &lv_font_montserrat_20, 0);
+    lv_obj_center(bt);
+    return row;
+}
+
+static lv_obj_t* makeSettingsPage(lv_obj_t* tab) {
+    lv_obj_t* page = lv_obj_create(tab);
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, LCD_W, LCD_H - 56 /* tab bar */ - 30 /* dot indicator strip */);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_style_bg_color(page, lvhex(C_BG), 0);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(page, LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER,
+                                LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top   (page, SAFE_TOP, 0);
+    lv_obj_set_style_pad_bottom(page, SAFE_BOT, 0);
+    lv_obj_set_style_pad_left  (page, SAFE_X, 0);
+    lv_obj_set_style_pad_right (page, SAFE_X, 0);
+    lv_obj_set_style_pad_row   (page, 6, 0);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    return page;
+}
+
 static void buildSettingsTab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, lvhex(C_BG), 0);
     lv_obj_set_style_pad_all(tab, 0, 0);
-    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
-    // Left-align rows on the cross axis; centering + LV_PCT(100) rows lets
-    // LVGL round widths up by 1 px per row on some builds and the whole
-    // container ends up wider than the viewport — visible as the tab
-    // "getting wide" the moment it's selected. Also lock scroll to vertical
-    // only so touch-drag on a row can't nudge the tab sideways.
-    lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_START,
-                               LV_FLEX_ALIGN_START,
-                               LV_FLEX_ALIGN_START);
-    lv_obj_set_scroll_dir(tab, LV_DIR_VER);
-    // Task #4: no snap or scroll-end anim on the Settings scroll surface.
-    lv_obj_set_scroll_snap_x(tab, LV_SCROLL_SNAP_NONE);
-    lv_obj_set_scroll_snap_y(tab, LV_SCROLL_SNAP_NONE);
-    lv_obj_set_style_anim_duration(tab, 0, LV_STATE_SCROLLED);
-    lv_obj_set_style_pad_gap(tab, 0, 0);
-    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);   // /improve: clean surface
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
 
-    // Section: Radios
-    makeSwitchRow(tab, LV_SYMBOL_WIFI,      "WiFi AP",         true, settingSwitchCb, SET_WIFI);
-    makeSwitchRow(tab, LV_SYMBOL_BLUETOOTH, "Bluetooth",       false, settingSwitchCb, SET_BT);
-    makeSwitchRow(tab, LV_SYMBOL_EYE_OPEN,  "BT discovery",    false, settingSwitchCb, SET_BTDISC);
+    // Page 1 — Radios (WiFi, BT, BT discovery, Silent startup)
+    s_settingsPages[0] = makeSettingsPage(tab);
+    makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_WIFI,      "WiFi AP",         true, settingSwitchCb, SET_WIFI);
+    makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_BLUETOOTH, "Bluetooth",       false, settingSwitchCb, SET_BT);
+    makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_EYE_OPEN,  "BT discovery",    false, settingSwitchCb, SET_BTDISC);
+    makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_EYE_CLOSE, "Silent USB",      false, settingSwitchCb, SET_SILENT);
 
-    // Section: Behaviour
-    // Watch port: NO status LED on this board (no hardware LED, no RGB
-    // pixel). The "Status LED" row is a stale carry-over from the Key.
-    // Row omitted; LED_PIN in Config.h is only kept for the LEDManager
-    // shim compile-compat. Firmware reports hidden_settings=["led"] via
-    // /api/stats so the web UI can hide its toggle too.
-    // makeSwitchRow(tab, LV_SYMBOL_POWER, "Status LED", true, settingSwitchCb, SET_LED);
-    // Silent startup off by default — a fresh flash should show the wearer
-    // that USB HID is up, not hide it. Users can still opt in.
-    makeSwitchRow(tab, LV_SYMBOL_EYE_CLOSE, "Silent startup",  false, settingSwitchCb, SET_SILENT);
-    makeSwitchRow(tab, LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
-    makeSwitchRow(tab, LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
-    // Autostart: gates whether the persisted boot_script runs at boot.
-    // Independent from Files-tab star, which sets *which* script is queued.
-    makeSwitchRow(tab, LV_SYMBOL_PLAY,       "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
+    // Page 2 — Behaviour (Logging, COM shell, Autostart, spacer)
+    s_settingsPages[1] = makeSettingsPage(tab);
+    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
+    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
+    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_PLAY,      "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
 
-    // DeadNet row removed from the AMOLED settings tab per user feedback.
-    // The web dashboard is where DeadNet lives — it needs the risky-mode
-    // acknowledge checkbox for DEAUTH/SNIFF, which is impractical on a
-    // wrist-sized screen. AMOLED settings stays lean.
-    // s_lanStatusLbl is left declared but never created; watchUiSetLan
-    // Connected() and watchUiSetDeadnetToggle() no-op when their target
-    // labels/switches are null.
+    // Page 3 — Actions (Reboot, Reset to standard, Factory reset, Brick)
+    s_settingsPages[2] = makeSettingsPage(tab);
+    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
+    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_LOOP,    "Reset to standard", "RESET",  false, resetStdBtnCb);
+    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_TRASH,   "Factory reset",     "WIPE",   true,  factoryResetBtnCb);
+    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_WARNING, "Brick firmware",    "BRICK",  true,  brickBtnCb);
 
-    // Section: Actions
-    makeActionRow(tab, LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
-    makeActionRow(tab, LV_SYMBOL_LOOP,    "Reset to standard", "RESET",  false, resetStdBtnCb);
-    makeActionRow(tab, LV_SYMBOL_TRASH,   "Factory reset",     "WIPE",   true,  factoryResetBtnCb);
-    makeActionRow(tab, LV_SYMBOL_WARNING, "Brick firmware",    "BRICK",  true,  brickBtnCb);
+    // Dot indicator strip at the bottom
+    s_settingsPageIndicator = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_settingsPageIndicator);
+    lv_obj_set_size(s_settingsPageIndicator, LCD_W, 30);
+    lv_obj_align(s_settingsPageIndicator, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_settingsPageIndicator, lvhex(C_BG), 0);
+    lv_obj_set_style_bg_opa(s_settingsPageIndicator, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(s_settingsPageIndicator, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_settingsPageIndicator, LV_FLEX_ALIGN_CENTER,
+                                                    LV_FLEX_ALIGN_CENTER,
+                                                    LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(s_settingsPageIndicator, 12, 0);
+    lv_obj_clear_flag(s_settingsPageIndicator, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
+        lv_obj_t* d = lv_obj_create(s_settingsPageIndicator);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_size(d, 10, 10);
+        lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(d, lvhex(C_LINE), 0);
+        s_settingsDots[i] = d;
+    }
 
-    // Footer version stamp
-    lv_obj_t* v = lv_label_create(tab);
-    lv_label_set_text(v, "ESP-Watch-BadUSB   ·   watch-web-1");
-    lv_obj_set_style_text_color(v, lvhex(C_MUTED), 0);
-    lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_pad_all(v, 14, 0);
+    // Gesture — swipe UP goes to next page, DOWN to previous. Attach on
+    // the tab itself so any child area of the page catches it.
+    lv_obj_add_event_cb(tab, settingsGestureCb, LV_EVENT_GESTURE, nullptr);
+
+    // Show page 1 first.
+    settingsShowPage(0);
 }
 
 // ---- public API ------------------------------------------------------------
@@ -599,6 +746,40 @@ void watchUiBegin() {
     buildHomeTab(s_tabHome);
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
+
+    // "Italic-Arial-looking" tab text on tap — my previous LV_PART_ITEMS
+    // pins on the tab_bar object never actually reached the tab buttons
+    // in LVGL 9: the tab_bar holds child button widgets directly, so
+    // styles on the container's LV_PART_ITEMS don't propagate. Iterate
+    // each direct button child after buildXTab() has returned and pin
+    // the font + transform on the button itself in every state. Only
+    // touch the buttons (no child-of-child) — that's what crashed on
+    // an earlier attempt.
+    {
+      uint32_t n = lv_obj_get_child_count(tabBar);
+      for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t* btn = lv_obj_get_child(tabBar, i);
+        if (!btn) continue;
+        for (lv_state_t st : { (lv_state_t)LV_STATE_DEFAULT,
+                               (lv_state_t)LV_STATE_CHECKED,
+                               (lv_state_t)LV_STATE_PRESSED,
+                               (lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED),
+                               (lv_state_t)LV_STATE_FOCUSED,
+                               (lv_state_t)LV_STATE_FOCUS_KEY }) {
+          lv_obj_set_style_text_font(btn, &lv_font_montserrat_18, st);
+          lv_obj_set_style_text_letter_space(btn, 0, st);
+          lv_obj_set_style_text_line_space (btn, 0, st);
+          lv_obj_set_style_text_opa(btn, LV_OPA_COVER, st);
+          lv_obj_set_style_transform_scale_x(btn, 256, st);
+          lv_obj_set_style_transform_scale_y(btn, 256, st);
+          lv_obj_set_style_transform_pivot_x(btn, 0, st);
+          lv_obj_set_style_transform_pivot_y(btn, 0, st);
+          lv_obj_set_style_pad_hor(btn, 10, st);
+          lv_obj_set_style_pad_ver(btn, 0, st);
+          lv_obj_set_style_anim_duration(btn, 0, st);
+        }
+      }
+    }
 
     // Toast on lv_layer_top() so watchUiFlash() from any tab is visible.
     s_flashLbl = lv_label_create(lv_layer_top());
