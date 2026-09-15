@@ -467,11 +467,30 @@ static void settingsShowPage(int p) {
     }
 }
 
+// Paged Settings gestures — LEFT/RIGHT (was UP/DOWN, which conflicted with
+// the clock-swipe reveal). Rules per user:
+//   * LEFT swipe on Settings: next page (dot advances). If already on the
+//     last page, consume the gesture so we don't leak into whatever
+//     LVGL would do next.
+//   * RIGHT swipe: if page > 0, previous page. If page == 0 (dot 1), we
+//     let the tabview default handler take it → jumps back to Files.
+// lv_indev_wait_release() cancels the current touch's further gesture
+// dispatch so the tabview doesn't ALSO react to the same swipe.
 static void settingsGestureCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
     lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
-    if      (d == LV_DIR_TOP)    settingsShowPage(s_settingsPage + 1);
-    else if (d == LV_DIR_BOTTOM) settingsShowPage(s_settingsPage - 1);
+    if (d == LV_DIR_LEFT) {
+        if (s_settingsPage < SETTINGS_PAGE_COUNT - 1) {
+            settingsShowPage(s_settingsPage + 1);
+        }
+        lv_indev_wait_release(lv_indev_active());  // never let tabview see it
+    } else if (d == LV_DIR_RIGHT) {
+        if (s_settingsPage > 0) {
+            settingsShowPage(s_settingsPage - 1);
+            lv_indev_wait_release(lv_indev_active());  // consumed, don't jump tabs
+        }
+        // else: page 0 and swiping right → let tabview handle it (back to Files)
+    }
 }
 
 // Big variant of the switch row for the paged Settings — Montserrat 22
@@ -747,14 +766,27 @@ void watchUiBegin() {
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
-    // "Italic-Arial-looking" tab text on tap — my previous LV_PART_ITEMS
-    // pins on the tab_bar object never actually reached the tab buttons
-    // in LVGL 9: the tab_bar holds child button widgets directly, so
-    // styles on the container's LV_PART_ITEMS don't propagate. Iterate
-    // each direct button child after buildXTab() has returned and pin
-    // the font + transform on the button itself in every state. Only
-    // touch the buttons (no child-of-child) — that's what crashed on
-    // an earlier attempt.
+    // Reset Settings paging back to page 0 (dot 1) whenever the tabview's
+    // active tab changes. Matches user ask: leaving Settings always
+    // rewinds to page 1, so entering Settings again always shows page 1
+    // and the right-swipe-to-Files gesture works from the first flick.
+    lv_obj_add_event_cb(tv, [](lv_event_t*){
+        settingsShowPage(0);
+    }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    // "Italic-Arial" Files tab (v5, final take):
+    // Confirmed from a photo of the running device — "Files" renders in
+    // a heavier / skewed font vs "Home"/"Settings" the moment it becomes
+    // the checked tab. Every previous fix styled the tab_bar or the tab
+    // button. The label INSIDE the button carries its OWN text_font
+    // (LVGL 9 creates it that way in lv_tabview_add_tab) and the theme
+    // sets that label's font_large in the checked state. That's what
+    // stretches the glyphs.
+    //   Fix: for each direct button child of the tab_bar, find its label
+    //   child (should be exactly one) and pin text_font + letter_space +
+    //   line_space + text_opa on THAT LABEL across every state.
+    //   Also pin the button's own font + transform (belt-and-braces),
+    //   pad it so the "Settings" glyph doesn't run off the right edge.
     {
       uint32_t n = lv_obj_get_child_count(tabBar);
       for (uint32_t i = 0; i < n; i++) {
@@ -766,7 +798,7 @@ void watchUiBegin() {
                                (lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED),
                                (lv_state_t)LV_STATE_FOCUSED,
                                (lv_state_t)LV_STATE_FOCUS_KEY }) {
-          lv_obj_set_style_text_font(btn, &lv_font_montserrat_18, st);
+          lv_obj_set_style_text_font(btn, &lv_font_montserrat_16, st);
           lv_obj_set_style_text_letter_space(btn, 0, st);
           lv_obj_set_style_text_line_space (btn, 0, st);
           lv_obj_set_style_text_opa(btn, LV_OPA_COVER, st);
@@ -774,9 +806,28 @@ void watchUiBegin() {
           lv_obj_set_style_transform_scale_y(btn, 256, st);
           lv_obj_set_style_transform_pivot_x(btn, 0, st);
           lv_obj_set_style_transform_pivot_y(btn, 0, st);
-          lv_obj_set_style_pad_hor(btn, 10, st);
+          lv_obj_set_style_pad_hor(btn, 4, st);
           lv_obj_set_style_pad_ver(btn, 0, st);
           lv_obj_set_style_anim_duration(btn, 0, st);
+        }
+        // Reach into the button and pin the LABEL widget's font too — this
+        // is the piece every earlier pass missed.
+        uint32_t cc = lv_obj_get_child_count(btn);
+        for (uint32_t j = 0; j < cc; j++) {
+          lv_obj_t* lbl = lv_obj_get_child(btn, j);
+          if (!lbl) continue;
+          for (lv_state_t st : { (lv_state_t)LV_STATE_DEFAULT,
+                                 (lv_state_t)LV_STATE_CHECKED,
+                                 (lv_state_t)LV_STATE_PRESSED,
+                                 (lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED),
+                                 (lv_state_t)LV_STATE_FOCUSED }) {
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, st);
+            lv_obj_set_style_text_letter_space(lbl, 0, st);
+            lv_obj_set_style_text_line_space (lbl, 0, st);
+            lv_obj_set_style_text_opa(lbl, LV_OPA_COVER, st);
+            lv_obj_set_style_transform_scale_x(lbl, 256, st);
+            lv_obj_set_style_transform_scale_y(lbl, 256, st);
+          }
         }
       }
     }
