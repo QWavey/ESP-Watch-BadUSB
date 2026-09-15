@@ -69,6 +69,12 @@ void watchUiScreenSleep();
 void watchUiScreenWake();
 bool watchUiScreenAsleep();
 
+// Real power-off via AXP2101 (bug-hunt #11 — SHUTDOWN was ESP.deepSleep(0),
+// which on the watch is CPU-only sleep; the PMU keeps rails alive so the
+// chip wakes on any touch/USB event). Requests the PMU to cut power for
+// good; if the call fails (PMU not up) falls back to deep sleep.
+void watchUiPowerOff();
+
 // ---- settings-tab bridges ----
 struct WatchUiPendingSettings {
     bool has_wifi;          bool wifi_on;

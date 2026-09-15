@@ -775,6 +775,21 @@ void watchUiScreenWake() {
 }
 bool watchUiScreenAsleep() { return s_screenAsleep; }
 
+void watchUiPowerOff() {
+    // Bug-hunt #11 fix: real shutdown via the AXP2101 PMU. deepSleep(0)
+    // was CPU-only — the PMU kept rails alive and the chip woke on any
+    // USB/touch event, so DuckyScript SHUTDOWN read as "screen goes
+    // black for a second, then everything's back". Now: paint the
+    // screen black (visual acknowledgement) and call s_pmu.shutdown().
+    Screen.off();
+    if (s_pmuReady) {
+        s_pmu.shutdown();
+    }
+    // If the PMU didn't shut us down (or wasn't up), deep-sleep as a
+    // fallback so the chip at least halts.
+    esp_deep_sleep_start();
+}
+
 void watchUiTick() {
     unsigned long now = millis();
     if (now - s_lastLvglTick >= 5) {

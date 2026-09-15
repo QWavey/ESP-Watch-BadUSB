@@ -358,7 +358,34 @@ String getSavedWiFiCredentials() {
             if (!first) json += ",";
             String ssid = line.substring(s1 + 6, s2);
             String pass = (p1 != -1 && p2 != -1) ? line.substring(p1 + 10, p2) : "";
-            json += "{\"ssid\":\"" + ssid + "\",\"pass\":\"" + pass + "\"}";
+            // Bug-hunt #21: escape " and \ (and control chars) in ssid/pass
+            // before splicing into JSON. Prior behaviour emitted broken JSON
+            // if a WPA2 PSK contained a literal " — the dashboard's JSON.
+            // parse rejected the whole payload and the saved-WiFi list read
+            // as empty.
+            auto jsonEsc = [](const String& in) {
+                String out; out.reserve(in.length() + 4);
+                for (size_t i = 0; i < in.length(); ++i) {
+                    char c = in[i];
+                    switch (c) {
+                        case '"':  out += "\\\""; break;
+                        case '\\': out += "\\\\"; break;
+                        case '\b': out += "\\b";  break;
+                        case '\f': out += "\\f";  break;
+                        case '\n': out += "\\n";  break;
+                        case '\r': out += "\\r";  break;
+                        case '\t': out += "\\t";  break;
+                        default:
+                            if ((unsigned char)c < 0x20) {
+                                char buf[8];
+                                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                                out += buf;
+                            } else out += c;
+                    }
+                }
+                return out;
+            };
+            json += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"pass\":\"" + jsonEsc(pass) + "\"}";
             first = false;
         }
     }

@@ -110,11 +110,26 @@ void saveCommandHistory() {
 void addToHistory(String command) {
   commandHistory.push_back(command);
 
+  bool trimmed = false;
   if (commandHistory.size() > MAX_HISTORY_SIZE) {
     commandHistory.erase(commandHistory.begin());
+    trimmed = true;
   }
 
-  saveCommandHistory();
+  // Bug-hunt round 5 fix #10: quadratic SD wear + latency. saveCommand
+  // History() was doing a full delete-and-rewrite of the entire history
+  // file on EVERY command — a 500-line DuckyScript triggered 500 O(N)
+  // rewrites. Now we APPEND only when the buffer wasn't trimmed
+  // (append is O(1) on FAT), and fall back to the full rewrite only when
+  // the ring buffer just dropped its oldest entry (then the on-disk copy
+  // has to match).
+  if (!sdCardPresent) return;
+  if (trimmed) {
+    saveCommandHistory();          // full rewrite because head dropped
+  } else {
+    File file = SD.open(FILE_HISTORY, FILE_APPEND);
+    if (file) { file.println(command); file.close(); }
+  }
 }
 
 void clearErrors() {

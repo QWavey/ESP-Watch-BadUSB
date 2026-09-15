@@ -391,7 +391,7 @@ void setup() {
   //
   // To force a reset on any future release, bump FIRMWARE_STAMP in Config.h.
   {
-    const uint32_t FIRMWARE_STAMP = 436;   // v4.36 - CRITICAL: /temp_resume.txt & /reboot_script.txt were read via loadScript() which prepends /scripts/, so every ATTACKMODE reboot silently discarded the resume file. Now read from SD root directly. Also: evalCondition strips wrapping parens (`IF ($_OS == LINUX)`), case-insensitive TRUE/FALSE (Hak5 built-ins use uppercase), string equality path uses toUpperCase compare, `==`/`!=` fall back to string when either side isn't numeric. ATTACKMODE cfg seeded from currentAttackMode (tokens only override fields they mention). ensureHidReady+3s wait on resume path so first-plug driver-bind window doesn't drop early keystrokes.
+    const uint32_t FIRMWARE_STAMP = 437;   // v4.37 - AttackMode bug-hunt #6 fix: substring "OFF"/"BLANK"/"NONE" hunter false-positived on numeric tokens like VID_0FF0, silently coercing ATTACKMODE into BLANK (hid=false, storage=false) and leaving units enumerating only as JTAG. Fix uses the parsed token flags. Bump forces the FIRMWARE_STAMP != stored clause below to reset the stale (hid=false, msc=true, am_no_hid_intent=true) trio on units that already got wedged by the old bug.
     uint32_t storedStamp = preferences.getUInt("fw_stamp", 0);
     if (storedStamp != FIRMWARE_STAMP) {
       Serial.printf("[BOOT] Firmware stamp changed (%u -> %u). Clearing "

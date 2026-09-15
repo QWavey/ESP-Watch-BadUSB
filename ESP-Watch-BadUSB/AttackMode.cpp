@@ -166,11 +166,18 @@ bool handleAttackModeLine(const String& line) {
   // leave the device with no USB interfaces at all — user probably fat-fingered
   // the line. Keep HID on as a minimum. BLANK is the OPT-IN way to remove
   // everything on purpose (recovery: `ATTACKMODE HID` via the web UI).
+  //
+  // Bug-hunt round 5 fix #6 — user report: watch enters a "broken flash
+  // state mode" where it enumerates as JTAG not HID. Root cause: the old
+  // line-substring "OFF"/"BLANK"/"NONE" match false-positived on numeric
+  // tokens like `VID_0FF0` or `PID_OFF1` (they contain "OFF"!). That let a
+  // benign ATTACKMODE HID VID_0FF0 fall through the safety net with cfg
+  // silently coerced to (hid=false, storage=false), producing ATTACKMODE
+  // BLANK on next boot → USB peripheral off → ROM's USB-Serial/JTAG stays
+  // the only device the host sees → wearer thinks the watch is bricked.
+  // Fix: check the actual PARSED token flags — no more substring hunting.
   bool anyKeyword = cfg.hid || cfg.storage ||
-                    line.indexOf("OFF") >= 0 ||
-                    line.indexOf("BLANK") >= 0 ||
-                    line.indexOf("NONE")  >= 0 ||
-                    line.indexOf("UNMOUNT") >= 0;
+                    sawOffToken || sawHidToken || sawStorageToken;
   if (!anyKeyword) {
     Serial.println("[ATTACKMODE] no HID/STORAGE/OFF/BLANK token; keeping HID on to avoid bricking");
     cfg.hid = true;

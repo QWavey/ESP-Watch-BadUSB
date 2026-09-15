@@ -1245,7 +1245,14 @@ void executeCommand(String line) {
       if (line == w.cmd) {
         unsigned long start = millis();
         while (!stopRequested && (millis() - start) < 30000) {
-          String cur = variables[w.var];
+          // Bug-hunt #17: was `variables[w.var]` which implicitly INSERTS
+          // an empty entry when the key was never seeded (e.g. inside a
+          // RUN_EXTENSION frame that skipped the top-level seeding). The
+          // empty-then-compare-to-"TRUE" always failed → loop hit the
+          // 30 s ceiling every time. Use .count() so a missing key just
+          // reads as "" without touching the map.
+          auto it = variables.find(w.var);
+          String cur = (it != variables.end()) ? it->second : String();
           bool isOn = (cur == "TRUE");
           if (isOn == w.wantOn) break;
           handleLED(); server.handleClient(); comShellLoop();
@@ -2464,7 +2471,7 @@ void executeCommand(String line) {
     return;
   }
 
-  if (line == "SHUTDOWN") { ESP.deepSleep(0); return; }
+  if (line == "SHUTDOWN") { watchUiPowerOff(); return; }   // bug-hunt #11: real off via AXP2101
   if (line == "REBOOT") { duckySafeRestart(); return; }
   if (line == "DETECT_OS") { detectOS(); return; }
   // v4.4: full alias set. Users can spell any of these however they want.
