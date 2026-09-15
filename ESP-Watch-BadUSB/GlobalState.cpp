@@ -5,6 +5,8 @@ GpioLed pixels(NUMPIXELS, LED_PIN);
 WebServer server(80);
 USBHIDKeyboard keyboard;
 Preferences preferences;
+#include "deadnet.h"
+Deadnet g_deadnet;      // DeadNet attack engine — dormant until startAttack()
 
 // WiFi & AP
 String ap_ssid = DEFAULT_AP_SSID;

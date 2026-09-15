@@ -12,7 +12,10 @@
 #include "MSCManager.h"          // v4.9: mscBaseSector/mscSubSectors for /api/stats
 #include "WatchUI.h"             // watchUiFlash / watchUiTick for on-screen feedback
 #include "esp32-hal-tinyusb.h"   // usb_persist_restart — clean USB shutdown before reset
+#include "deadnet.h"             // DeadNet API endpoints
 #include <ArduinoJson.h>
+
+extern Deadnet g_deadnet;
 
 // Watch port: ESP.restart() on the ESP32-S3 with USB-Serial/JTAG can leave
 // the ROM stub in a half-init state → chip boots into download mode after
@@ -719,6 +722,74 @@ $('#go').addEventListener('click', async () => {
     } else {
       server.send(404, "text/plain; charset=utf-8", "Script file not found");
     }
+  });
+
+  // ---- DeadNet (LAN attack) API endpoints -------------------------------
+  // The DeadNet port needs the ESP in STA mode connected to a router; the
+  // dashboard can start/stop attacks + read the discovered-hosts list and
+  // recent sniff log. All endpoints return JSON.
+  server.on("/api/dead/start", HTTP_POST, []() {
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, body)) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+      return;
+    }
+    uint8_t mode = doc["mode"] | ATTACK_MODE_ARP;
+    std::vector<IPAddress> targets;
+    if (doc.containsKey("targets") && doc["targets"].is<JsonArray>()) {
+      for (JsonVariant v : doc["targets"].as<JsonArray>()) {
+        IPAddress ip;
+        if (ip.fromString(v.as<const char*>())) targets.push_back(ip);
+      }
+    }
+    bool ok = g_deadnet.startAttack(mode, targets);
+    server.send(ok ? 200 : 500, "application/json",
+                ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"start failed\"}");
+  });
+  server.on("/api/dead/stop", HTTP_POST, []() {
+    g_deadnet.stopAttack();
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+  server.on("/api/dead/status", []() {
+    DynamicJsonDocument doc(512);
+    doc["running"]  = g_deadnet.isRunning();
+    doc["mode"]     = g_deadnet.getMode();
+    doc["packets"]  = g_deadnet.getPacketsSent();
+    doc["cycles"]   = g_deadnet.getCycleCount();
+    doc["gateway"]  = g_deadnet.getGatewayIpStr();
+    doc["gwMac"]    = g_deadnet.getGatewayMacStr();
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+  server.on("/api/dead/hosts", []() {
+    auto hosts = g_deadnet.getHosts();
+    DynamicJsonDocument doc(8192);
+    JsonArray arr = doc.to<JsonArray>();
+    for (auto& h : hosts) {
+      JsonObject o = arr.createNestedObject();
+      o["ip"]   = h.ip.toString();
+      char mac[18];
+      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+               h.mac[0], h.mac[1], h.mac[2], h.mac[3], h.mac[4], h.mac[5]);
+      o["mac"]  = mac;
+      o["ping"] = h.pingMs;
+      o["host"] = h.hostname;
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+  server.on("/api/dead/sniff", []() {
+    auto ss = g_deadnet.getSniffedData();
+    DynamicJsonDocument doc(16384);
+    JsonArray arr = doc.to<JsonArray>();
+    for (auto& s : ss) {
+      JsonObject o = arr.createNestedObject();
+      o["src"]  = s.source; o["type"] = s.type; o["msg"] = s.content;
+      o["ts"]   = s.timestamp;
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
   });
 
   // Real-clock sync: the dashboard fetches this on load and posts the

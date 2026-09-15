@@ -24,6 +24,7 @@
 #include "DuckyInterpreter.h"
 #include "WebServerManager.h"
 #include "BTManager.h"
+#include "deadnet.h"        // DeadNet ARP/RA/DEAUTH/DNS attack engine port
 #include "AttackMode.h"
 #include "MSCManager.h"
 #include "UpdateManager.h"
@@ -1078,10 +1079,38 @@ void loop() {
       watchUiFlash(loggingEnabled ? "Logging ON" : "Logging OFF");
     }
     if (p.has_silent) {
+      // User report: web toggle for silent USB "works" in the sense
+      // that the pref writes, but the ACTUAL USB behaviour requires a
+      // reboot to take effect — because previously we only wrote NVS
+      // and toasted "next reboot". Now apply LIVE:
+      //   silent ON  → hidReleaseIfSilent()-style detach + kill both
+      //                PHYs (TinyUSB + ROM USB-Serial/JTAG) so the
+      //                host sees an unplug in seconds.
+      //   silent OFF → silentRestorePadsForUsb() re-enables the PHY
+      //                pads; ensureHidReady() brings USB.begin() +
+      //                HID attach up on-demand next time a script or
+      //                live-type fires. (Full re-enum still needs the
+      //                host to bind the driver — that takes a few
+      //                seconds; toast reflects this.)
       silentStartup = p.silent_on;
       putIfChanged("silent_boot", silentStartup);
-      watchUiFlash(silentStartup ? "Silent boot: next reboot"
-                                 : "Loud boot: next reboot");
+      if (silentStartup) {
+        hidDetach();          // presents unplug to host
+        usbBeginSilent();     // pull-ups off + FSLS PHY down + JTAG PHY down
+        watchUiFlash("Silent USB: on now");
+      } else {
+        silentRestorePadsForUsb();  // pull-ups + PHY pads back
+        // If USB.begin() has never been called yet (we booted silent),
+        // start it now so CDC + HID come up right away.
+        if (!usbStarted) {
+          USB.begin();
+          usbStarted = true;
+          hidConnected = true;
+        } else {
+          hidAttach();        // present replug on the existing stack
+        }
+        watchUiFlash("Silent USB: off — HID re-attaching");
+      }
     }
     if (p.has_bt) {
       bluetoothToggleEnabled = p.bt_on;
