@@ -3739,6 +3739,94 @@ function filterWiki() { renderWiki(document.getElementById('wikiSearch').value);
 // type "Serial" to the COM port that appears in Device Manager.
 // Toggling reboots the ESP so the USB descriptor rebuilds; HID and STORAGE
 // are unavailable while this is on.
+// -------------------- DeadNet / LAN attack -----------------------------
+// The Settings tab hosts a "DeadNet — LAN attack" card. The switch is
+// gated on the ESP being joined to a WiFi network (STA_CONNECTED state).
+// While ON, the firmware disables HID/MSC/BT so nothing else touches the
+// radio.
+function dnReadMask() {
+    let m = 0;
+    if (document.getElementById('dnMArp')?.checked)    m |= 1 << 0;
+    if (document.getElementById('dnMRa')?.checked)     m |= 1 << 1;
+    if (document.getElementById('dnMDeauth')?.checked) m |= 1 << 2;
+    if (document.getElementById('dnMDns')?.checked)    m |= 1 << 4;
+    if (document.getElementById('dnMSniff')?.checked)  m |= 1 << 5;
+    return m || 1;    // fall back to ARP only
+}
+function dnPaintBadge(lanUp, ssid) {
+    const b = document.getElementById('dnLanBadge');
+    if (!b) return;
+    if (lanUp) {
+        b.textContent = 'LAN: ' + (ssid || 'connected');
+        b.style.background = '#032'; b.style.color = '#8f6';
+    } else {
+        b.textContent = 'LAN: not connected';
+        b.style.background = '#302'; b.style.color = '#f88';
+    }
+}
+async function dnPollStatus() {
+    try {
+        const [statR, lanR] = await Promise.all([
+            fetch('/api/dead/status').then(r => r.json()).catch(() => null),
+            fetch('/api/lan/status').then(r => r.json()).catch(() => null),
+        ]);
+        if (lanR) dnPaintBadge(lanR.connected, lanR.ssid);
+        if (statR) {
+            const sw = document.getElementById('dnToggle');
+            if (sw && sw.checked !== !!statR.running) sw.checked = !!statR.running;
+            const s = document.getElementById('dnStatus');
+            if (s) {
+                s.textContent = statR.running
+                    ? `Running. Gateway ${statR.gateway||'?'} (${statR.gwMac||'?'}) · ${statR.packets||0} pkts · ${statR.cycles||0} cycles`
+                    : 'Idle.';
+            }
+        }
+        // Discovered hosts
+        const hosts = await fetch('/api/dead/hosts').then(r => r.json()).catch(() => []);
+        const h = document.getElementById('dnHosts');
+        if (h) {
+            if (!hosts.length) h.textContent = '– no hosts yet –';
+            else h.innerHTML = hosts.map(x =>
+                `<div style="padding:3px 0;border-bottom:1px solid #223;"><b>${x.ip}</b> · ${x.mac} · ${x.host||''} · ${x.ping||0} ms</div>`
+            ).join('');
+        }
+    } catch(_) {}
+}
+async function toggleDeadnet() {
+    const sw = document.getElementById('dnToggle');
+    if (!sw) return;
+    const wantOn = sw.checked;
+    // Gate: check LAN before starting.
+    const lan = await fetch('/api/lan/status').then(r => r.json()).catch(() => null);
+    if (wantOn && (!lan || !lan.connected)) {
+        alert('Cannot start DeadNet — the watch is not joined to any WiFi network.\n\nUse the "Internet Connection" card above to join the LAN you want to attack, then try again.');
+        sw.checked = false;
+        return;
+    }
+    const url = wantOn ? '/api/dead/start' : '/api/dead/stop';
+    const body = wantOn ? JSON.stringify({mode: dnReadMask()}) : '{}';
+    try {
+        const r = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body,
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.ok === false) {
+            alert('DeadNet ' + (wantOn ? 'start' : 'stop') + ' failed: ' + (j.error || r.status));
+            sw.checked = !wantOn;
+        } else {
+            dnPollStatus();
+        }
+    } catch (e) {
+        alert('DeadNet request failed: ' + e.message);
+        sw.checked = !wantOn;
+    }
+}
+// Poll every 3 s so the badge + host table stay live.
+setInterval(dnPollStatus, 3000);
+setTimeout(dnPollStatus, 500);
+
 function toggleCom() {
     const on = document.getElementById('comToggle').checked;
     const warn = on

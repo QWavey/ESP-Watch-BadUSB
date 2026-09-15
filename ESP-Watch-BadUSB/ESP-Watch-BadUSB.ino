@@ -1065,7 +1065,14 @@ void loop() {
     s_lastSet = millis();
     WatchUiPendingSettings p = watchUiConsumePendingSettings();
     auto putIfChanged = [](const char* key, bool v){
-      if (preferences.getBool(key, !v) != v) preferences.putBool(key, v);
+      // Bug-hunt #19: was `getBool(key, !v)` — that reads the opposite as
+      // the missing-key default, so a MISSING key + v==true returned false
+      // and always wrote (harmless once), but a MISSING key + v==false
+      // returned true and always wrote too. Every first-boot toggle
+      // triggered an NVS write even when its default was already the
+      // desired value — quiet NVS wear. Correct guard: read with `v` as
+      // the default, so a missing key returns v and the write is skipped.
+      if (preferences.getBool(key, v) != v) preferences.putBool(key, v);
     };
     if (p.has_led) {
       ledEnabled = p.led_on;
@@ -1239,6 +1246,44 @@ void loop() {
       for (int i = 0; i < 40; ++i) { watchUiTick(); delay(20); }
       preferences.end();                          // #8: persist bricked=true
       usb_persist_restart(RESTART_NO_PERSIST);
+    }
+    if (pe.has_deadnet) {
+      // Watch-side DeadNet toggle. Gate on WiFi.STA connected; if the
+      // wearer flips it on without a LAN, flash an error + snap the
+      // switch back off. Same behaviour as the web dashboard toggle.
+      if (pe.deadnet_on) {
+        if (WiFi.status() != WL_CONNECTED) {
+          watchUiFlash("DeadNet: no LAN - join a WiFi first");
+          watchUiSetDeadnetToggle(false);
+        } else if (g_deadnet.startAttack(ATTACK_MODE_ARP)) {
+          // "Everything off except WiFi" - detach USB HID/MSC + stop BT.
+          hidDetach();
+          if (bluetoothToggleEnabled) { stopBT(); bluetoothToggleEnabled = false; }
+          if (preferences.getBool("bt_toggle", false) != false)
+            preferences.putBool("bt_toggle", false);
+          watchUiFlash("DeadNet armed - HID + BT off");
+        } else {
+          watchUiFlash("DeadNet: start failed");
+          watchUiSetDeadnetToggle(false);
+        }
+      } else {
+        g_deadnet.stopAttack();
+        hidAttach();
+        watchUiFlash("DeadNet stopped - HID re-attached");
+      }
+    }
+  }
+
+  // Watch-side LAN + DeadNet status: refresh the badge in Settings and
+  // keep the AMOLED switch in sync with the actual running state (a web
+  // toggle should reflect on-screen and vice versa). Cheap 1 Hz poll.
+  {
+    static unsigned long lastLanPoll = 0;
+    if (millis() - lastLanPoll >= 1000) {
+      lastLanPoll = millis();
+      bool up = (WiFi.status() == WL_CONNECTED);
+      watchUiSetLanConnected(up, up ? WiFi.SSID().c_str() : nullptr);
+      watchUiSetDeadnetToggle(g_deadnet.isRunning());
     }
   }
 

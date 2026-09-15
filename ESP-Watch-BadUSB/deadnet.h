@@ -104,4 +104,8 @@ private:
     static void dnsSpoofTask(void* pv);
 };
 
+// Global instance, defined in GlobalState.cpp — every .cpp/.ino that
+// includes deadnet.h can just call g_deadnet.startAttack() etc.
+extern class Deadnet g_deadnet;
+
 #endif // DEADNET_H

@@ -98,7 +98,10 @@ struct WatchUiPendingExtras {
     bool has_autostart;   bool autostart_on;
     bool want_reset_std;   // Reset every user toggle to OFF + wipe boot_script
     bool want_brick;       // Set bricked=true; on next boot only the clock runs
+    bool has_deadnet;     bool deadnet_on;   // DeadNet start/stop from AMOLED
 };
+void watchUiSetDeadnetToggle(bool on);
+void watchUiSetLanConnected(bool connected, const char* ssid);
 WatchUiPendingExtras watchUiConsumePendingExtras();
 
 typedef void (*WatchUiWalkthroughDone)();

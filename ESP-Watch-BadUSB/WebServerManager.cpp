@@ -485,7 +485,10 @@ $('#go').addEventListener('click', async () => {
       
       server.send(200, "text/plain", "USB settings saved. Rebooting for changes to take effect...");
       delay(1000);
-      ESP.restart();
+      // Bug-hunt #9: was plain ESP.restart() — on the S3's USB-Serial/
+      // JTAG boot path that leaves the ROM stub half-init and the chip
+      // reboots into download mode instead of the app. Use the safe path.
+      watchSafeRestart();
     } else {
       server.send(400, "text/plain", "Invalid JSON");
     }
@@ -724,11 +727,31 @@ $('#go').addEventListener('click', async () => {
     }
   });
 
-  // ---- DeadNet (LAN attack) API endpoints -------------------------------
-  // The DeadNet port needs the ESP in STA mode connected to a router; the
-  // dashboard can start/stop attacks + read the discovered-hosts list and
-  // recent sniff log. All endpoints return JSON.
+  // ---- LAN / DeadNet API endpoints --------------------------------------
+  // LAN status: is the ESP joined to a WiFi network as STA? DeadNet needs
+  // this true to attack.
+  server.on("/api/lan/status", []() {
+    DynamicJsonDocument doc(256);
+    bool up = (WiFi.status() == WL_CONNECTED);
+    doc["connected"] = up;
+    if (up) {
+      doc["ssid"]    = WiFi.SSID();
+      doc["ip"]      = WiFi.localIP().toString();
+      doc["gateway"] = WiFi.gatewayIP().toString();
+      doc["rssi"]    = WiFi.RSSI();
+    }
+    String out; serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
   server.on("/api/dead/start", HTTP_POST, []() {
+    // Gate: must have STA-connected LAN. DeadNet needs a gateway MAC + a
+    // /24 subnet to poison.
+    if (WiFi.status() != WL_CONNECTED) {
+      server.send(409, "application/json",
+        "{\"ok\":false,\"error\":\"no LAN — join a WiFi first\"}");
+      return;
+    }
     String body = server.arg("plain");
     DynamicJsonDocument doc(1024);
     if (deserializeJson(doc, body)) {
@@ -744,11 +767,30 @@ $('#go').addEventListener('click', async () => {
       }
     }
     bool ok = g_deadnet.startAttack(mode, targets);
+    if (ok) {
+      // Task: "when its on everything gets offed except wifi". Detach
+      // TinyUSB (HID+MSC+CDC) so packet-inject frames aren't stealing
+      // CPU / USB IRQs; stop BT so the coexistence engine doesn't
+      // preempt the WiFi driver during a poison cycle.
+      extern void hidDetach();
+      extern void stopBT();
+      extern bool bluetoothToggleEnabled;
+      hidDetach();
+      if (bluetoothToggleEnabled) { stopBT(); bluetoothToggleEnabled = false; }
+      Serial.println("[/api/dead/start] HID + BT stopped while DeadNet runs");
+    }
     server.send(ok ? 200 : 500, "application/json",
                 ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"start failed\"}");
   });
   server.on("/api/dead/stop", HTTP_POST, []() {
     g_deadnet.stopAttack();
+    // Symmetrical: bring HID back for whoever wants it next. BT stays
+    // off — that was a user pref that we deliberately overrode; user
+    // can flip it back on in Settings when they want it.
+    // USBManager.h already declares hidAttach() as `bool hidAttach()`; a
+    // local `extern void hidAttach()` here re-declared ambiguously.
+    hidAttach();
+    Serial.println("[/api/dead/stop] HID re-attached; BT left off");
     server.send(200, "application/json", "{\"ok\":true}");
   });
   server.on("/api/dead/status", []() {

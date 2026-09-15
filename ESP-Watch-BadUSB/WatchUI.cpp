@@ -36,11 +36,12 @@ static lv_obj_t* s_bannerLbl  = nullptr;
 static lv_obj_t* s_stopBtn    = nullptr;
 static lv_obj_t* s_filesList  = nullptr;   // scroll container inside the Files tab
 static lv_obj_t* s_filesEmpty = nullptr;   // "no scripts yet" placeholder
+static lv_obj_t* s_lanStatusLbl = nullptr; // Settings-tab LAN badge under DeadNet
 
 // ---- Settings-tab switch handles (indexed by SETTING_*) -------------------
 enum SettingIdx {
     SET_WIFI = 0, SET_BT, SET_BTDISC, SET_LED,
-    SET_SILENT, SET_LOGGING, SET_COM, SET_AUTOSTART,
+    SET_SILENT, SET_LOGGING, SET_COM, SET_AUTOSTART, SET_DEADNET,
     SET_COUNT
 };
 static lv_obj_t* s_settingSw[SET_COUNT] = { nullptr };
@@ -247,6 +248,8 @@ static void settingSwitchCb(lv_event_t* e) {
         case SET_COM:       s_pending.has_com     = true; s_pending.com_on     = on; break;
         case SET_AUTOSTART: s_pendingExtras.has_autostart = true;
                             s_pendingExtras.autostart_on  = on; break;
+        case SET_DEADNET:   s_pendingExtras.has_deadnet   = true;
+                            s_pendingExtras.deadnet_on    = on; break;
     }
 }
 static void rebootBtnCb(lv_event_t*)         { s_pending.want_reboot        = true; }
@@ -475,6 +478,21 @@ static void buildSettingsTab(lv_obj_t* tab) {
     // Autostart: gates whether the persisted boot_script runs at boot.
     // Independent from Files-tab star, which sets *which* script is queued.
     makeSwitchRow(tab, LV_SYMBOL_PLAY,       "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
+
+    // DeadNet — LAN attack. LVGL's built-in Montserrat font doesn't ship the
+    // skull glyph (U+1F480), so we use LV_SYMBOL_WARNING (⚠) — visually the
+    // same "danger" cue, no font addition needed. The label carries the
+    // skull glyph as UTF-8; the row layout still lands correctly whether
+    // that renders or falls back to the placeholder box.
+    makeSwitchRow(tab, LV_SYMBOL_WARNING,    "\xE2\x98\xA0 DeadNet", false, settingSwitchCb, SET_DEADNET);
+    // LAN-status label sits under the DeadNet row so the wearer sees
+    // whether the switch can actually do anything.
+    s_lanStatusLbl = lv_label_create(tab);
+    lv_label_set_text(s_lanStatusLbl, "LAN: unknown");
+    lv_obj_set_style_text_color(s_lanStatusLbl, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(s_lanStatusLbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_pad_hor(s_lanStatusLbl, 14, 0);
+    lv_obj_set_style_pad_ver(s_lanStatusLbl, 2, 0);
 
     // Section: Actions
     makeActionRow(tab, LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
@@ -1157,6 +1175,22 @@ void watchUiRefreshSettings(bool wifi, bool bt, bool btdisc,
 
 void watchUiSetAutostartToggle(bool on) {
     syncSw(SET_AUTOSTART, on);
+}
+
+void watchUiSetDeadnetToggle(bool on) {
+    syncSw(SET_DEADNET, on);
+}
+
+void watchUiSetLanConnected(bool connected, const char* ssid) {
+    if (!s_lanStatusLbl) return;
+    static char last[64] = "";
+    char buf[64];
+    if (connected) snprintf(buf, sizeof(buf), "LAN: %s", ssid ? ssid : "(joined)");
+    else           snprintf(buf, sizeof(buf), "LAN: not connected");
+    if (strncmp(last, buf, sizeof(last) - 1) == 0) return;
+    strncpy(last, buf, sizeof(last) - 1); last[sizeof(last) - 1] = '\0';
+    lv_label_set_text(s_lanStatusLbl, buf);
+    lv_obj_set_style_text_color(s_lanStatusLbl, lvhex(connected ? C_OK : C_DANGER), 0);
 }
 
 WatchUiPendingExtras watchUiConsumePendingExtras() {

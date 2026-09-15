@@ -344,6 +344,33 @@
                     </div>
                 </div>
 
+                <!-- DeadNet + LAN card (data-setting=lan_mode → hidden on Key/DevKitC via /api/stats hidden_settings). -->
+                <div class="setting-group" data-setting="lan_mode">
+                    <h4>💀 DeadNet — LAN attack</h4>
+                    <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
+                        ARP-poison / DEAUTH / DNS-spoof every host on the LAN the watch is joined to (Internet Connection above). Requires an active STA connection — the AP that hosts this dashboard stays up.
+                    </p>
+                    <div class="flex-row" style="justify-content:space-between;align-items:center;">
+                        <span title="Starts DeadNet against the LAN the watch is joined to. If no LAN is connected, the switch stays off and an error is shown. Turning it ON also disables HID/MSC/BT so no side-channel disturbs the packet flow.">
+                            DeadNet running <span id="dnLanBadge" style="margin-left:8px;font-size:11px;padding:2px 6px;border-radius:4px;background:#332;color:#fa4;">LAN: unknown</span>
+                        </span>
+                        <label class="switch"><input type="checkbox" id="dnToggle" onchange="toggleDeadnet()"><span class="slider"></span></label>
+                    </div>
+                    <div style="margin-top:10px;font-size:12px;color:var(--text-muted);">
+                        Mode:
+                        <label style="margin-right:8px;"><input type="checkbox" id="dnMArp" checked> ARP</label>
+                        <label style="margin-right:8px;"><input type="checkbox" id="dnMRa"> RA</label>
+                        <label style="margin-right:8px;"><input type="checkbox" id="dnMDeauth"> DEAUTH</label>
+                        <label style="margin-right:8px;"><input type="checkbox" id="dnMDns"> DNS-spoof</label>
+                        <label style="margin-right:8px;"><input type="checkbox" id="dnMSniff"> SNIFF</label>
+                    </div>
+                    <div id="dnStatus" style="margin-top:10px;font-size:12px;">Idle.</div>
+                    <details style="margin-top:10px;font-size:12px;">
+                        <summary>Discovered hosts</summary>
+                        <div id="dnHosts" style="margin-top:8px;">–</div>
+                    </details>
+                </div>
+
                 <!-- v4.15: System Stats moved OUT of Settings and INTO the Stats tab.
                      The IDs (#settCpu / settRam / settFlash / settSd / settUptime /
                      settTempCard / settTemp) stay identical so the polling code that

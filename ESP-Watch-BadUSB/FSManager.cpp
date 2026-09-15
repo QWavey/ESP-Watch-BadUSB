@@ -1,6 +1,7 @@
 #include "FSManager.h"
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <vector>              // bug-hunt #20 fix uses std::vector
 #include "LEDManager.h"
 #include "LogManager.h"
 #include <ArduinoJson.h>
@@ -600,36 +601,37 @@ bool deleteDirectory(String path) {
     return SD.remove(path);
   }
 
+  // Bug-hunt #20: collect the whole entry list FIRST, THEN close the
+  // iterator, THEN delete. The previous version held dir.openNextFile()
+  // open across recursive deleteDirectory() calls — on the ESP-IDF FAT
+  // layer that races with SD.remove/rmdir happening in the recursive
+  // frame and returned stale entries (or -1). Trees with subdirs failed
+  // to fully delete.
   dir.rewindDirectory();
-  File file = dir.openNextFile();
-  while (file) {
-    // v4.4: ESP32 SD library's file.name() returns the FULL absolute path
-    // (e.g. "/scripts/foo.txt"), not just the leaf. The old code did
-    //   filepath = path + "/" + file.name()
-    // which produced "/scripts//scripts/foo.txt" — SD.remove failed and the
-    // whole tree walk aborted, leaving handleDeleteFile with a 500. Strip
-    // everything up to and including the last '/' from file.name() first.
-    String fname = String(file.name());
-    int lastSlash = fname.lastIndexOf('/');
-    if (lastSlash >= 0) fname = fname.substring(lastSlash + 1);
-    String filepath = path;
-    if (!filepath.endsWith("/")) filepath += "/";
-    filepath += fname;
-    if (file.isDirectory()) {
-      if (!deleteDirectory(filepath)) {
-        dir.close();
-        return false;
-      }
-    } else {
-      if (!SD.remove(filepath)) {
-        dir.close();
-        return false;
-      }
+  std::vector<String> files;
+  std::vector<String> subdirs;
+  {
+    File file = dir.openNextFile();
+    while (file) {
+      String fname = String(file.name());
+      int lastSlash = fname.lastIndexOf('/');
+      if (lastSlash >= 0) fname = fname.substring(lastSlash + 1);
+      String filepath = path;
+      if (!filepath.endsWith("/")) filepath += "/";
+      filepath += fname;
+      if (file.isDirectory()) subdirs.push_back(filepath);
+      else                    files.push_back(filepath);
+      file = dir.openNextFile();
     }
-    file = dir.openNextFile();
   }
-  dir.close();
+  dir.close();      // release the parent iterator before we mutate the FS
 
+  for (const String& f : files) {
+    if (!SD.remove(f)) return false;
+  }
+  for (const String& s : subdirs) {
+    if (!deleteDirectory(s)) return false;
+  }
   return SD.rmdir(path);
 }
 
