@@ -721,6 +721,35 @@ $('#go').addEventListener('click', async () => {
     }
   });
 
+  // Real-clock sync: the dashboard fetches this on load and posts the
+  // browser's current epoch + tz offset. The firmware stores both in NVS
+  // and uses them to render HH:MM on the on-screen clock face. Persisted
+  // across reboots — after the first sync the clock is always meaningful
+  // as long as the wearer has opened the dashboard at least once.
+  server.on("/api/set-time", HTTP_POST, []() {
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, body)) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+      return;
+    }
+    uint64_t epoch = doc["epoch"].as<uint64_t>();     // UTC seconds
+    int32_t  tz    = doc["tz_seconds"].as<int32_t>(); // local offset from UTC
+    if (epoch < 1700000000ULL) {                       // sanity: pre-2023 = bogus
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"epoch too small\"}");
+      return;
+    }
+    preferences.putULong64("clock_epoch",   epoch);
+    preferences.putLong   ("clock_tz_secs", tz);
+    // Record the local millis() at time of sync so the drift correction
+    // watchUiSetClockSeconds does can subtract it from millis() at
+    // display time. Wrap-around at ~49 days is handled by re-syncing.
+    preferences.putULong  ("clock_sync_ms", millis());
+    Serial.printf("[/api/set-time] epoch=%llu tz=%d ms=%lu\n",
+                  (unsigned long long)epoch, (int)tz, (unsigned long)millis());
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
   server.on("/api/stats", []() {
     DynamicJsonDocument doc(4096);
     // Watch port: expose a `hidden_settings` list so a single dashboard

@@ -3,6 +3,28 @@ let currentBrowserPath = '/', selectedFile = null, currentStats = null;
 let selectedDesign = null, progressInterval;
 let bootScriptsSelected = [];
 let scriptChanged = false;
+
+// Watch clock sync: on first load, POST the browser's current epoch +
+// timezone offset to /api/set-time. The Watch firmware persists this and
+// uses it to render HH:MM on the on-screen clock face. Best-effort — no
+// UI feedback, silent failure. Re-syncs at most once per browser session
+// (sessionStorage flag) so opening the dashboard repeatedly doesn't spam
+// the endpoint.
+(function syncWatchClock() {
+    try {
+        if (sessionStorage.getItem('watch_time_synced_v1') === '1') return;
+        const epoch = Math.floor(Date.now() / 1000);
+        // getTimezoneOffset returns MINUTES west of UTC (positive if you're
+        // WEST of UTC). We want SECONDS east of UTC on the wire.
+        const tz = -new Date().getTimezoneOffset() * 60;
+        fetch('/api/set-time', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ epoch, tz_seconds: tz })
+        }).then(r => { if (r.ok) sessionStorage.setItem('watch_time_synced_v1', '1'); })
+          .catch(() => { /* dashboard still loads fine without a clock sync */ });
+    } catch (_) { /* private mode / no fetch — ignore */ }
+})();
 let lastErrorState = ""; // Track state to avoid redundant Issue tab re-renders
 
 // Trigger browser warning for unsaved changes

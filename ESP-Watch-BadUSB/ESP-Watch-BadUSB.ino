@@ -967,11 +967,28 @@ void loop() {
 
   // Clock face — update HH:MM every second while the overlay is visible.
   // Uses uptime, not NTP, because this device runs offline.
+  // Clock — feed real epoch time when we have one (POSTed by the web
+  // dashboard's script.js via /api/set-time, persisted in NVS as
+  // clock_epoch + clock_tz_secs + clock_sync_ms). Otherwise fall back
+  // to uptime.
   {
     static unsigned long lastClock = 0;
     if (watchUiClockVisible() && millis() - lastClock >= 1000) {
       lastClock = millis();
-      watchUiSetClockSeconds(millis() / 1000);
+      uint64_t syncEpoch = preferences.getULong64("clock_epoch",  0);
+      int32_t  tz        = preferences.getLong   ("clock_tz_secs", 0);
+      uint32_t syncMs    = preferences.getULong  ("clock_sync_ms", 0);
+      uint64_t nowSecs;
+      if (syncEpoch >= 1700000000ULL) {
+        // Add the milliseconds that have passed on the local clock since
+        // the sync. millis() wraps ~49.7 d — for a watch that gets an
+        // occasional resync via the dashboard this is fine.
+        uint32_t elapsedMs = millis() - syncMs;   // unsigned wrap OK
+        nowSecs = syncEpoch + (elapsedMs / 1000) + tz;
+      } else {
+        nowSecs = millis() / 1000;                // uptime fallback
+      }
+      watchUiSetClockSeconds((uint32_t)(nowSecs & 0xFFFFFFFFULL));
     }
   }
 
@@ -1068,10 +1085,12 @@ void loop() {
     if (p.want_reboot) {
       watchUiFlash("Rebooting...");
       for (int i = 0; i < 20; ++i) { watchUiTick(); delay(20); }
-      // Watch port: usb_persist_restart(RESTART_NO_PERSIST) does a clean
-      // TinyUSB shutdown before reset — plain ESP.restart() on the S3 can
-      // leave the ROM stub in a half-init state and the chip boots into
-      // download mode instead of the app.
+      // Bug-hunt finding #8: flush NVS before restarting so a putBool from
+      // the same tick isn't lost when TinyUSB shutdown cuts power to the
+      // NVS write task. Then usb_persist_restart(RESTART_NO_PERSIST) does
+      // the clean shutdown before reset — plain ESP.restart() on the S3
+      // can leave the ROM stub in a half-init state and boot to download.
+      preferences.end();
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (p.want_factory_reset) {
@@ -1149,12 +1168,14 @@ void loop() {
       preferences.remove("boot_script");
       watchUiFlash("Reset to standard — rebooting");
       for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
+      preferences.end();                          // #8: flush the 10 puts above
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (pe.want_brick) {
       preferences.putBool("bricked", true);
       watchUiFlash("Bricking — reflash to recover");
       for (int i = 0; i < 40; ++i) { watchUiTick(); delay(20); }
+      preferences.end();                          // #8: persist bricked=true
       usb_persist_restart(RESTART_NO_PERSIST);
     }
   }

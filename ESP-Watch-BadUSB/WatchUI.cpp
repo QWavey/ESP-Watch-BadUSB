@@ -324,21 +324,11 @@ static void buildHomeTab(lv_obj_t* tab) {
     // (created in watchUiBegin) so the power-off countdown / SD hot-plug
     // toast floats above Home, Files, Settings and the clock overlay.
 
-    // Toast overlay (hidden until watchUiFlash). Bug #22: sit ABOVE the STOP
-    // button (74 tall, bottom -10) with generous space above so the toast
-    // doesn't get clipped by tall multi-line messages either.
-    s_flashLbl = lv_label_create(tab);
-    lv_obj_set_style_text_color(s_flashLbl, lvhex(0xFFB020), 0);
-    lv_obj_set_style_text_font(s_flashLbl, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_bg_color(s_flashLbl, lvhex(0x201510), 0);
-    lv_obj_set_style_bg_opa(s_flashLbl, LV_OPA_90, 0);
-    lv_obj_set_style_pad_all(s_flashLbl, 10, 0);
-    lv_obj_set_style_radius(s_flashLbl, 8, 0);
-    lv_obj_set_width(s_flashLbl, LCD_W - 40);
-    lv_label_set_long_mode(s_flashLbl, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_flashLbl, "");
-    lv_obj_align(s_flashLbl, LV_ALIGN_BOTTOM_MID, 0, -100);
-    lv_obj_add_flag(s_flashLbl, LV_OBJ_FLAG_HIDDEN);
+    // Toast overlay — moved out of buildHomeTab per bug-hunt finding #7.
+    // Previously parented to the home tab, so a watchUiFlash("Deleted foo")
+    // fired from the Files tab was invisible until the wearer switched
+    // tabs. Now created on lv_layer_top() in watchUiBegin() alongside the
+    // banner so every tab sees the toast.
 
     // STOP button — full width along the bottom
     s_stopBtn = lv_btn_create(tab);
@@ -560,6 +550,21 @@ void watchUiBegin() {
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
+    // Toast on lv_layer_top() so watchUiFlash() from any tab is visible.
+    s_flashLbl = lv_label_create(lv_layer_top());
+    lv_obj_set_style_text_color(s_flashLbl, lvhex(0xFFB020), 0);
+    lv_obj_set_style_text_font(s_flashLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_letter_space(s_flashLbl, 0, 0);
+    lv_obj_set_style_bg_color(s_flashLbl, lvhex(0x201510), 0);
+    lv_obj_set_style_bg_opa(s_flashLbl, LV_OPA_90, 0);
+    lv_obj_set_style_pad_all(s_flashLbl, 10, 0);
+    lv_obj_set_style_radius(s_flashLbl, 8, 0);
+    lv_obj_set_width(s_flashLbl, LCD_W - 40);
+    lv_label_set_long_mode(s_flashLbl, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_flashLbl, "");
+    lv_obj_align(s_flashLbl, LV_ALIGN_BOTTOM_MID, 0, -110);
+    lv_obj_add_flag(s_flashLbl, LV_OBJ_FLAG_HIDDEN);
+
     // Banner on lv_layer_top() — floats above every tab and the clock. See
     // watchUiSetBanner() which move-foregrounds it on each show so the
     // clock overlay never occludes the countdown / hot-plug toast.
@@ -657,7 +662,9 @@ bool watchUiClockVisible() {
 
 void watchUiSetClockSeconds(uint32_t seconds) {
     if (!s_clockTime) return;
-    uint32_t h = seconds / 3600;
+    // `seconds` is the caller's chosen time source (real epoch when we
+    // have one, uptime otherwise). Render as HH:MM mod 24 h.
+    uint32_t h = (seconds / 3600) % 24;
     uint32_t m = (seconds / 60) % 60;
     static char last[8] = "";
     char buf[8];
@@ -834,6 +841,10 @@ void watchUiFlash(const char* text) {
     if (!s_flashLbl || !text) return;
     lv_label_set_text(s_flashLbl, text);
     lv_obj_clear_flag(s_flashLbl, LV_OBJ_FLAG_HIDDEN);
+    // Toast lives on lv_layer_top() with the clock and the banner — force it
+    // to the front of the sibling order so a running clock overlay can't
+    // occlude the message.
+    lv_obj_move_foreground(s_flashLbl);
     s_flashUntil = millis() + 5000;
 }
 
