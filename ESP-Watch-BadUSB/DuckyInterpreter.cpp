@@ -1471,28 +1471,13 @@ void executeCommand(String line) {
   // a stored "buttonScript" string at first-encounter, then WAIT_FOR_BUTTON_PRESS
   // blocks the script until the button fires, at which point the stored
   // block executes. Very partial support: we accept the block and store it.
-  if (line == "BUTTON_DEF" || line.startsWith("BUTTON_DEF")) {
-    Serial.println("[DUCKY] BUTTON_DEF - accepted (fires on GPIO0 button press)");
-    return;
-  }
-  if (line == "END_BUTTON") return;
-  if (line == "DISABLE_BUTTON") return;
-  if (line == "WAIT_FOR_BUTTON_PRESS") {
-    Serial.println("[DUCKY] Waiting for GPIO0 button press...");
-    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
-    int last = HIGH;
-    unsigned long start = millis();
-    while (!stopRequested && (millis() - start) < 300000UL) {
-      int cur = digitalRead(RESET_BUTTON_PIN);
-      if (last == HIGH && cur == LOW) { delay(50); return; }
-      last = cur;
-      handleLED(); server.handleClient(); comShellLoop();
-      extern void pumpButton(); pumpButton();   // v4.26 HIGH #1: 10s factory-reset must still fire during this wait
-      extern void hostLedTick(); hostLedTick();   // v4.23: pump LED mirror while blocked
-      delay(20);
-    }
-    return;
-  }
+  // Bug-hunt #5: this duplicate WAIT_FOR_BUTTON_PRESS / BUTTON_DEF /
+  // END_BUTTON / DISABLE_BUTTON block was dead code — the real handlers
+  // above (lines ~1286-1352) match first and this block is unreachable.
+  // Left in place it would race the shared g_button_* bus if any future
+  // refactor changed dispatch order. Removed entirely.
+  // (was: BUTTON_DEF / END_BUTTON / DISABLE_BUTTON / WAIT_FOR_BUTTON_PRESS
+  // spinning on digitalRead in isolation.)
 
   // v4.20: WAIT_FOR_SCROLL_CHANGE / WAIT_FOR_CAPS_CHANGE / WAIT_FOR_NUM_CHANGE
   // fires when the host toggles the given lock LED. The exfil extensions

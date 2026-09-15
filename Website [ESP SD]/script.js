@@ -2103,16 +2103,23 @@ function updateStats() {
         }
 
         // Update toggles even if hidden
-        // Synchronize Settings (Toggles)
+        // Synchronize Settings (Toggles) — the /api/stats poll runs every
+        // 5 s and is the two-way-sync bridge: whenever the wearer flips a
+        // switch on the AMOLED, the firmware persists the new state and
+        // the next poll here pulls it into the web checkbox DOM. Every
+        // toggle the AMOLED can flip is echoed by /api/stats.
         const toggles = {
-            'ledToggle': data.ledEnabled,
-            'loggingToggle': data.loggingEnabled,
-            'btToggle': data.btToggleEnabled,
-            'btDiscoveryToggle': data.btDiscoveryEnabled
+            'ledToggle':         data.ledEnabled,
+            'loggingToggle':     data.loggingEnabled,
+            'btToggle':          data.btToggleEnabled,
+            'btDiscoveryToggle': data.btDiscoveryEnabled,
+            'silentToggle':      data.silentStartup,
+            'comToggle':         data.comEnabled,
+            'dnToggle':          data.deadnetRunning,
         };
         for (const [id, val] of Object.entries(toggles)) {
             const el = document.getElementById(id);
-            if (el) el.checked = (val === true);
+            if (el && el.checked !== !!val) el.checked = !!val;
         }
 
         // Sync new WiFi/connect toggles
@@ -3753,14 +3760,14 @@ function dnReadMask() {
     if (document.getElementById('dnMSniff')?.checked)  m |= 1 << 5;
     return m || 1;    // fall back to ARP only
 }
-function dnPaintBadge(lanUp, ssid) {
+function dnPaintBadge(lanUp, note) {
     const b = document.getElementById('dnLanBadge');
     if (!b) return;
     if (lanUp) {
-        b.textContent = 'LAN: ' + (ssid || 'connected');
+        b.textContent = 'LAN: link up';
         b.style.background = '#032'; b.style.color = '#8f6';
     } else {
-        b.textContent = 'LAN: not connected';
+        b.textContent = 'LAN: ' + (note || 'no link');
         b.style.background = '#302'; b.style.color = '#f88';
     }
 }
@@ -3770,7 +3777,7 @@ async function dnPollStatus() {
             fetch('/api/dead/status').then(r => r.json()).catch(() => null),
             fetch('/api/lan/status').then(r => r.json()).catch(() => null),
         ]);
-        if (lanR) dnPaintBadge(lanR.connected, lanR.ssid);
+        if (lanR) dnPaintBadge(lanR.connected, lanR.reason || 'no link');
         if (statR) {
             const sw = document.getElementById('dnToggle');
             if (sw && sw.checked !== !!statR.running) sw.checked = !!statR.running;
@@ -3796,10 +3803,17 @@ async function toggleDeadnet() {
     const sw = document.getElementById('dnToggle');
     if (!sw) return;
     const wantOn = sw.checked;
-    // Gate: check LAN before starting.
+    // Gate: DeadNet targets WIRED LAN (Ethernet). Not the WiFi network
+    // the watch might be joined to. If the wired driver isn't up (which
+    // today it never is — USB Host + Ethernet-adapter driver is not yet
+    // implemented on this firmware), refuse and explain.
     const lan = await fetch('/api/lan/status').then(r => r.json()).catch(() => null);
     if (wantOn && (!lan || !lan.connected)) {
-        alert('Cannot start DeadNet — the watch is not joined to any WiFi network.\n\nUse the "Internet Connection" card above to join the LAN you want to attack, then try again.');
+        const why = (lan && lan.reason) || 'wired Ethernet not connected';
+        alert('Cannot start DeadNet — ' + why + '.\n\n' +
+              'DeadNet attacks the WIRED LAN (like the flashnuke deadnet_lan_kill payload against eth1). ' +
+              'That needs USB Host mode + an Ethernet-adapter driver (RTL8153/CDC-ECM) — those are not shipping in this build yet. ' +
+              'Attaching a USB-C-to-Ethernet adapter WILL NOT work until that driver lands.');
         sw.checked = false;
         return;
     }

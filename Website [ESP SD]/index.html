@@ -346,9 +346,10 @@
 
                 <!-- DeadNet + LAN card (data-setting=lan_mode → hidden on Key/DevKitC via /api/stats hidden_settings). -->
                 <div class="setting-group" data-setting="lan_mode">
-                    <h4>💀 DeadNet — LAN attack</h4>
+                    <h4>💀 DeadNet — WIRED LAN attack</h4>
                     <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">
-                        ARP-poison / DEAUTH / DNS-spoof every host on the LAN the watch is joined to (Internet Connection above). Requires an active STA connection — the AP that hosts this dashboard stays up.
+                        ARP-poison / DEAUTH / DNS-spoof every host on the <b>wired</b> LAN the watch is attached to via a USB-C Ethernet adapter (same idea as flashnuke's <code>deadnet_lan_kill</code> against <code>eth1</code>). The AP that hosts this dashboard stays up on WiFi. <br><br>
+                        <b>Availability:</b> the USB-Host + Ethernet-adapter driver is not yet implemented — plugging a USB-C-to-Ethernet adapter into the watch does NOT bring up an <code>eth</code> netif today. Switch stays disabled until the driver lands.
                     </p>
                     <div class="flex-row" style="justify-content:space-between;align-items:center;">
                         <span title="Starts DeadNet against the LAN the watch is joined to. If no LAN is connected, the switch stays off and an error is shown. Turning it ON also disables HID/MSC/BT so no side-channel disturbs the packet flow.">

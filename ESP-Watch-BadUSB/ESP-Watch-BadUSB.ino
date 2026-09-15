@@ -1248,12 +1248,13 @@ void loop() {
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (pe.has_deadnet) {
-      // Watch-side DeadNet toggle. Gate on WiFi.STA connected; if the
-      // wearer flips it on without a LAN, flash an error + snap the
-      // switch back off. Same behaviour as the web dashboard toggle.
+      // Watch-side DeadNet toggle. Gate on WIRED Ethernet link up. The
+      // USB Host + Ethernet-adapter driver isn't implemented yet, so
+      // this always trips the "no link" branch today.
+      bool wiredUp = false;   // TODO: real ETH.linkUp() once driver ships
       if (pe.deadnet_on) {
-        if (WiFi.status() != WL_CONNECTED) {
-          watchUiFlash("DeadNet: no LAN - join a WiFi first");
+        if (!wiredUp) {
+          watchUiFlash("DeadNet: wired Ethernet not connected");
           watchUiSetDeadnetToggle(false);
         } else if (g_deadnet.startAttack(ATTACK_MODE_ARP)) {
           // "Everything off except WiFi" - detach USB HID/MSC + stop BT.
@@ -1281,8 +1282,11 @@ void loop() {
     static unsigned long lastLanPoll = 0;
     if (millis() - lastLanPoll >= 1000) {
       lastLanPoll = millis();
-      bool up = (WiFi.status() == WL_CONNECTED);
-      watchUiSetLanConnected(up, up ? WiFi.SSID().c_str() : nullptr);
+      // WIRED LAN status (Ethernet adapter over USB Host). Always down
+      // today; keep the label honest so the wearer doesn't think a
+      // WiFi STA connection would qualify.
+      bool wiredUp = false;   // TODO: real ETH.linkUp() once driver ships
+      watchUiSetLanConnected(wiredUp, wiredUp ? "link up" : "no wired link");
       watchUiSetDeadnetToggle(g_deadnet.isRunning());
     }
   }

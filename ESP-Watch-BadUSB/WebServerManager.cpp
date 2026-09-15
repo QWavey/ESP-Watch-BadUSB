@@ -728,28 +728,46 @@ $('#go').addEventListener('click', async () => {
   });
 
   // ---- LAN / DeadNet API endpoints --------------------------------------
-  // LAN status: is the ESP joined to a WiFi network as STA? DeadNet needs
-  // this true to attack.
-  server.on("/api/lan/status", []() {
+  // Corrected model per user feedback: LAN = WIRED Ethernet (like the
+  // flashnuke deadnet_lan_kill payload does over eth1). The current Watch
+  // firmware has NO wired Ethernet — the S3's USB PHY is in device mode
+  // and there's no USB Host + CDC-ECM/RTL8153 driver wired up yet. So
+  // wiredLanUp() returns false today; the UI surfaces that honestly and
+  // DeadNet's start endpoint refuses to run until the driver lands.
+  //
+  // When USB Host + Ethernet adapter driver is added later this stub
+  // becomes a real link-state check on the ETH interface.
+  auto wiredLanUp = [](void) -> bool {
+    // TODO: replace with real ETH.linkUp() once USB Host + RTL8153 driver
+    // lands. Currently always false because the S3's USB stays in device
+    // mode presenting HID+MSC+CDC and can't drive an Ethernet adapter.
+    return false;
+  };
+
+  server.on("/api/lan/status", [wiredLanUp]() {
     DynamicJsonDocument doc(256);
-    bool up = (WiFi.status() == WL_CONNECTED);
-    doc["connected"] = up;
-    if (up) {
-      doc["ssid"]    = WiFi.SSID();
-      doc["ip"]      = WiFi.localIP().toString();
-      doc["gateway"] = WiFi.gatewayIP().toString();
-      doc["rssi"]    = WiFi.RSSI();
+    bool up = wiredLanUp();
+    doc["connected"]      = up;
+    doc["driverPresent"]  = false;   // true once USB Host + adapter driver ships
+    doc["reason"]         = up ? "" : "wired Ethernet unavailable — USB Host + adapter driver not yet implemented";
+    // Legacy hint the web JS also reads: pass the WiFi-STA status so the
+    // Internet-Connection card can still show whether the ESP is joined
+    // to a WiFi (for other uses; NOT for DeadNet).
+    doc["staWifiConnected"] = (WiFi.status() == WL_CONNECTED);
+    if (WiFi.status() == WL_CONNECTED) {
+      doc["staSsid"]    = WiFi.SSID();
+      doc["staIp"]      = WiFi.localIP().toString();
     }
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
   });
 
-  server.on("/api/dead/start", HTTP_POST, []() {
-    // Gate: must have STA-connected LAN. DeadNet needs a gateway MAC + a
-    // /24 subnet to poison.
-    if (WiFi.status() != WL_CONNECTED) {
+  server.on("/api/dead/start", HTTP_POST, [wiredLanUp]() {
+    // Gate: DeadNet targets WIRED LAN (eth), not the WiFi the watch is
+    // joined to. Without wired Ethernet the attack has nowhere to go.
+    if (!wiredLanUp()) {
       server.send(409, "application/json",
-        "{\"ok\":false,\"error\":\"no LAN — join a WiFi first\"}");
+        "{\"ok\":false,\"error\":\"wired Ethernet not connected — USB Host + adapter driver not yet implemented\"}");
       return;
     }
     String body = server.arg("plain");
@@ -961,6 +979,16 @@ $('#go').addEventListener('click', async () => {
     doc["autoConnectEnabled"] = autoConnectEnabled;
     doc["saveOnConnectEnabled"] = saveOnConnectEnabled;
     doc["silentStartup"] = silentStartup;
+    // User ask: web UI toggle state should track AMOLED switch state and
+    // vice versa. /api/stats is polled by the dashboard every 5 s, so
+    // include every toggle the AMOLED can flip so the web-side JS can
+    // sync its checkbox DOMs to reality.
+    doc["autostartEnabled"] = preferences.getBool("autostart_on", false);
+    doc["deadnetRunning"]   = g_deadnet.isRunning();
+    // Wired-LAN state: DeadNet can only fire against wired Ethernet.
+    // driverPresent=false today (USB Host + adapter driver TBD).
+    doc["lanWiredUp"]       = false;
+    doc["lanDriverPresent"] = false;
     // v4.4: expose tutorial state so the frontend knows whether to show the
     // first-boot walk-through overlay. Factory reset wipes 'tutorial_done'
     // via preferences.clear(), so it re-fires on next boot.
