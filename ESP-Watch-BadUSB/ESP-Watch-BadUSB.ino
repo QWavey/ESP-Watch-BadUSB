@@ -579,7 +579,14 @@ void setup() {
   // once per NVS.
   if (!preferences.getBool("prefs_off_v2", false)) {
     Serial.println("[BOOT] prefs_off_v2 migration — clearing user toggles");
-    preferences.putBool("prefs_off_v2",    true);
+    // Bug-hunt round C-2: write the migration-done flag LAST. Previously it
+    // was put FIRST — a power loss between that commit and the toggle
+    // writes below marked the migration "done" on flash while leaving stale
+    // toggle values, so the next boot would skip the migration and inherit
+    // whatever the prior session persisted (e.g. wifi_toggle=true / com_on=
+    // true from a factory image). Now: reset every toggle first, THEN set
+    // the flag. A power loss anywhere in the middle just leaves the flag
+    // clear so the migration re-runs on the next boot.
     preferences.putBool("led_enabled",     false);
     preferences.putBool("logging_enabled", false);
     preferences.putBool("autoconnect",     false);
@@ -591,6 +598,7 @@ void setup() {
     preferences.putBool("autostart_on",    false);
     preferences.remove ("boot_script");
     // silent_boot deliberately NOT touched.
+    preferences.putBool("prefs_off_v2",    true);   // flag LAST — see comment above
   }
 
   // ---- Bricked-mode gate ---------------------------------------------
@@ -1102,8 +1110,19 @@ void loop() {
       silentStartup = p.silent_on;
       putIfChanged("silent_boot", silentStartup);
       if (silentStartup) {
+        // Bug-hunt round C-4: preserve usbStarted across the live silent-on
+        // path. usbBeginSilent() unconditionally sets usbStarted=false (its
+        // BOOT-TIME job is to promise "USB.begin() has NOT been called
+        // yet"); but on a LIVE toggle USB.begin() has already been called
+        // this session. If we let usbStarted flip to false, the very next
+        // silent-off toggle takes the `if (!usbStarted) USB.begin()` branch
+        // below and calls USB.begin() a SECOND time on an already-init
+        // TinyUSB stack — reproducible descriptor rebuild crash after
+        // silent-on → silent-off → silent-on. Save + restore around it.
+        bool wasStarted = usbStarted;
         hidDetach();          // presents unplug to host
         usbBeginSilent();     // pull-ups off + FSLS PHY down + JTAG PHY down
+        usbStarted = wasStarted;   // restore — see comment above
         watchUiFlash("Silent USB: on now");
       } else {
         silentRestorePadsForUsb();  // pull-ups + PHY pads back

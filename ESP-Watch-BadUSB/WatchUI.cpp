@@ -94,6 +94,11 @@ static const int LCD_H = LCD_HEIGHT;
 static const int SAFE_X   = 40;
 static const int SAFE_TOP = 12;
 static const int SAFE_BOT = 20;
+// Manual tab-strip height. File-scope so makeSettingsPage() can subtract it
+// from the settings-page height instead of a stale hard-coded `56` that
+// dated to the old built-in tab-bar (now tab_bar_size = 0). Bug-hunt R2.
+static const int STRIP_H  = 44;
+static const int DOT_STRIP_H = 30;
 
 static lv_color_t lvhex(uint32_t rgb) { return lv_color_hex(rgb & 0xFFFFFF); }
 
@@ -347,9 +352,13 @@ static void buildHomeTab(lv_obj_t* tab) {
     // tabs. Now created on lv_layer_top() in watchUiBegin() alongside the
     // banner so every tab sees the toast.
 
-    // STOP button — full width along the bottom
+    // STOP button — inside the rounded-corner safe area along the bottom.
+    // Bug-hunt R10: was LCD_W - 24 (12 px margin), whose bottom-right
+    // corner fell OUTSIDE the panel's ~60 px corner radius and got
+    // sliced. LCD_W - 2*SAFE_X (=330 px) stays inside the visible circle
+    // and matches the settings rows.
     s_stopBtn = lv_btn_create(tab);
-    lv_obj_set_size(s_stopBtn, LCD_W - 24, 74);
+    lv_obj_set_size(s_stopBtn, LCD_W - 2 * SAFE_X, 74);
     lv_obj_align(s_stopBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(s_stopBtn, lvhex(C_DANGER), 0);
     lv_obj_set_style_radius(s_stopBtn, 12, 0);
@@ -467,37 +476,13 @@ static void settingsShowPage(int p) {
     }
 }
 
-// Paged Settings gestures — LEFT/RIGHT (was UP/DOWN, which conflicted with
-// the clock-swipe reveal). Rules per user:
-//   * LEFT swipe on Settings: next page (dot advances). If already on the
-//     last page, consume the gesture so we don't leak into whatever
-//     LVGL would do next.
-//   * RIGHT swipe: if page > 0, previous page. If page == 0 (dot 1), we
-//     let the tabview default handler take it → jumps back to Files.
-// lv_indev_wait_release() cancels the current touch's further gesture
-// dispatch so the tabview doesn't ALSO react to the same swipe.
-static void settingsGestureCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-    // Bug-hunt round 15: null-guard lv_indev_active(). In a gesture
-    // callback it's essentially always non-null, but a synthetic
-    // event dispatch (or a re-entry during shutdown) could pass a
-    // null indev and deref would crash.
-    lv_indev_t* indev = lv_indev_active();
-    if (!indev) return;
-    lv_dir_t d = lv_indev_get_gesture_dir(indev);
-    if (d == LV_DIR_LEFT) {
-        if (s_settingsPage < SETTINGS_PAGE_COUNT - 1) {
-            settingsShowPage(s_settingsPage + 1);
-        }
-        lv_indev_wait_release(indev);  // never let tabview see it
-    } else if (d == LV_DIR_RIGHT) {
-        if (s_settingsPage > 0) {
-            settingsShowPage(s_settingsPage - 1);
-            lv_indev_wait_release(indev);  // consumed, don't jump tabs
-        }
-        // else: page 0 and swiping right → let tabview handle it (back to Files)
-    }
-}
+// NOTE: Bug-hunt R3 — the previous settingsGestureCb() installed on the
+// Settings tab itself has been REMOVED. An identical handler is registered
+// on the tabview in watchUiBegin() (line ~837) with a proper active-tab
+// check + lv_event_stop_processing(). Keeping both meant LVGL's bubble
+// dispatched the same gesture twice — swipe LEFT once and the page
+// advanced by two, skipping the middle page entirely. Only the tabview
+// handler remains now.
 
 // Big variant of the switch row for the paged Settings — Montserrat 22
 // label, 60x36 switch, generous padding. Reuses the pending-settings
@@ -600,7 +585,12 @@ static lv_obj_t* makeBigActionRow(lv_obj_t* parent, const char* icon,
 static lv_obj_t* makeSettingsPage(lv_obj_t* tab) {
     lv_obj_t* page = lv_obj_create(tab);
     lv_obj_remove_style_all(page);
-    lv_obj_set_size(page, LCD_W, LCD_H - 56 /* tab bar */ - 30 /* dot indicator strip */);
+    // Bug-hunt R2: the manual tab strip lives outside the tabview (on scr),
+    // so the tab content already has full tabview-content height. Only
+    // subtract the bottom dot indicator strip. Previously we subtracted a
+    // stale 56 that used to be the built-in tab bar size, leaving 12 px of
+    // dead space between the last row and the dot indicator.
+    lv_obj_set_size(page, LCD_W, LCD_H - STRIP_H - DOT_STRIP_H);
     lv_obj_set_pos(page, 0, 0);
     lv_obj_set_style_bg_color(page, lvhex(C_BG), 0);
     lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
@@ -629,7 +619,14 @@ static void buildSettingsTab(lv_obj_t* tab) {
     makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_EYE_OPEN,  "BT discovery",    false, settingSwitchCb, SET_BTDISC);
     makeBigSwitchRow(s_settingsPages[0], LV_SYMBOL_EYE_CLOSE, "Silent USB",      false, settingSwitchCb, SET_SILENT);
 
-    // Page 2 — Behaviour (Logging, COM shell, Autostart, spacer)
+    // Page 2 — Behaviour (Logging, COM shell, Autostart)
+    // DeadNet + LAN-status row were re-added by the swarm bug-hunt agent
+    // per an enum slot they saw, but the user explicitly asked earlier
+    // for DeadNet to live in the WEB dashboard only (needs the risky-
+    // mode acknowledge checkbox which is impractical on wrist size).
+    // The watchUiSetDeadnetToggle / watchUiSetLanConnected setters
+    // remain wired — they now no-op when their target widgets don't
+    // exist, which is correct for this build.
     s_settingsPages[1] = makeSettingsPage(tab);
     makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
     makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
@@ -665,9 +662,9 @@ static void buildSettingsTab(lv_obj_t* tab) {
         s_settingsDots[i] = d;
     }
 
-    // Gesture — swipe UP goes to next page, DOWN to previous. Attach on
-    // the tab itself so any child area of the page catches it.
-    lv_obj_add_event_cb(tab, settingsGestureCb, LV_EVENT_GESTURE, nullptr);
+    // Bug-hunt R3: the tab-level gesture handler was removed; a single
+    // handler on the tabview (see watchUiBegin) owns Settings LEFT/RIGHT
+    // paging now. Two handlers = double-advance per swipe.
 
     // Show page 1 first.
     settingsShowPage(0);
@@ -688,155 +685,176 @@ void watchUiBegin() {
     lv_obj_set_style_pad_all(scr, 0, 0);
 
     // Tabview: two tabs, big enough tap targets for a wrist screen.
+    // The built-in tab bar is HIDDEN (tab_bar_size = 0) and replaced with
+    // a manual 3-button strip below. Every previous attempt to tame the
+    // "italic Files" glyph fight was against LVGL's default theme — the
+    // theme applies text_font_large + transform on checked tab items and
+    // overrides local-style pins in ways that vary between LVGL versions.
+    // Building the strip ourselves = zero theme interference = no way for
+    // the checked button's text to render differently.
     lv_obj_t* tv = lv_tabview_create(scr);
     s_tabView = tv;
     lv_obj_set_size(tv, LCD_W, LCD_H);
-    lv_tabview_set_tab_bar_size(tv, 56);
+    lv_tabview_set_tab_bar_size(tv, 0);   // hide built-in bar
     lv_obj_set_style_bg_color(tv, lvhex(C_BG), 0);
 
-    // Style the tab bar to match the palette (no gradient, subtle line).
-    // Fix "stretched settings tab": LVGL's default tab-btn checked style
-    // gives the active tab a wider background pill than the inactive one.
-    // Style them identically (only text colour + a bottom underline change
-    // on select) and the two pills stop dancing sideways.
-    lv_obj_t* tabBar = lv_tabview_get_tab_bar(tv);
-    lv_obj_set_style_bg_color(tabBar, lvhex(C_SURFACE), 0);
-    lv_obj_set_style_border_side(tabBar, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_width(tabBar, 1, 0);
-    lv_obj_set_style_border_color(tabBar, lvhex(C_LINE), 0);
-    lv_obj_set_style_text_color(tabBar, lvhex(C_MUTED), 0);
-    lv_obj_set_style_text_color(tabBar, lvhex(C_TEXT),  LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(tabBar, &lv_font_montserrat_18, 0);
-    // Kill the tab button's own background chip so the active tab doesn't
-    // look wider than the inactive one; add a subtle bottom underline on
-    // the selected tab instead.
-    lv_obj_set_style_bg_opa(tabBar, LV_OPA_TRANSP, LV_PART_ITEMS);
-    lv_obj_set_style_bg_opa(tabBar, LV_OPA_TRANSP, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_border_side (tabBar, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_border_width(tabBar, 3, LV_PART_ITEMS | LV_STATE_CHECKED);
-    lv_obj_set_style_border_color(tabBar, lvhex(C_ACCENT), LV_PART_ITEMS | LV_STATE_CHECKED);
-    // "Tab stretched like italic font" — after v1 (transform_scale only) still
-    // reproduced on the Files tab, the real culprit is the default theme
-    // widening the checked tab-item via BIGGER text_letter_space + a slightly
-    // heavier text_font. Force both to the same fixed values across every
-    // state on every part of the tab-button, and lock its horizontal padding
-    // so the button's own layout can't change size on select.
-    {
-      const auto pin = [&](lv_state_t st) {
-        lv_style_selector_t sel = LV_PART_ITEMS | st;
-        // Italic-Arial-looking tab-text stretch on tap: LVGL 9's default
-        // theme animates transform_scale AND swaps to a slightly larger
-        // font_font_large on checked. Pin everything that can change so
-        // the tab render is byte-identical in every state.
-        lv_obj_set_style_transform_scale_x(tabBar, 256, sel);
-        lv_obj_set_style_transform_scale_y(tabBar, 256, sel);
-        lv_obj_set_style_transform_pivot_x(tabBar, 0, sel);
-        lv_obj_set_style_transform_pivot_y(tabBar, 0, sel);
-        lv_obj_set_style_text_letter_space(tabBar, 0, sel);
-        lv_obj_set_style_text_line_space (tabBar, 0, sel);
-        lv_obj_set_style_text_font(tabBar, &lv_font_montserrat_18, sel);
-        lv_obj_set_style_pad_hor(tabBar, 12, sel);
-        lv_obj_set_style_pad_ver(tabBar, 0, sel);
-        lv_obj_set_style_anim_duration(tabBar, 0, sel);
-        lv_obj_set_style_text_opa(tabBar, LV_OPA_COVER, sel);
-      };
-      pin((lv_state_t)LV_STATE_DEFAULT);
-      pin((lv_state_t)LV_STATE_CHECKED);
-      pin((lv_state_t)LV_STATE_PRESSED);
-      pin((lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED));
-      pin((lv_state_t)LV_STATE_FOCUS_KEY);
-      pin((lv_state_t)LV_STATE_FOCUSED);
-    }
-    // Disable tab-switch slide animation — feels laggy on QSPI AMOLED.
+    // The built-in tab bar is hidden (tab_bar_size = 0 above). All the
+    // former styling / child-iteration is gone — we own the strip now.
     lv_obj_set_style_anim_duration(tv, 0, 0);
-    // Task #4: also disable scroll snap + scroll-end anim on the tabview
-    // and its content container so page drag follows the finger 1:1.
     lv_obj_set_scroll_snap_x(tv, LV_SCROLL_SNAP_NONE);
     lv_obj_set_scroll_snap_y(tv, LV_SCROLL_SNAP_NONE);
     lv_obj_set_style_anim_duration(tv, 0, LV_STATE_SCROLLED);
-    // Settings tab scrolls vertically; polish it too.
-    // (Done below after s_tabSet is bound.)
 
-    // Swipe-up on the tabview brings the clock back. LVGL emits a
-    // LV_EVENT_GESTURE with LV_DIR_TOP when the user drags upward.
-    lv_obj_add_event_cb(tv, [](lv_event_t* e){
-        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-        lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
-        if (d == LV_DIR_TOP) watchUiShowClock();
-    }, LV_EVENT_GESTURE, nullptr);
-
-    s_tabHome  = lv_tabview_add_tab(tv, LV_SYMBOL_HOME     "  Home");
-    s_tabFiles = lv_tabview_add_tab(tv, LV_SYMBOL_FILE     "  Files");
-    s_tabSet   = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS "  Settings");
+    s_tabHome  = lv_tabview_add_tab(tv, "H");
+    s_tabFiles = lv_tabview_add_tab(tv, "F");
+    s_tabSet   = lv_tabview_add_tab(tv, "S");
     buildHomeTab(s_tabHome);
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
-    // Reset Settings paging back to page 0 (dot 1) whenever the tabview's
-    // active tab changes. Matches user ask: leaving Settings always
-    // rewinds to page 1, so entering Settings again always shows page 1
-    // and the right-swipe-to-Files gesture works from the first flick.
+    // ---- Manual tab strip -----------------------------------------------
+    // Since we hid LVGL's built-in tab bar (tab_bar_size=0), draw our own.
+    // Every attempt to make LVGL's tab_bar behave — pinning text_font on
+    // the container, on LV_PART_ITEMS, on the child buttons, on the
+    // button's label — was defeated by the theme. Owning the strip means
+    // no theme can override our font.
+    //
+    // Also pushes the tabview's content down by the strip height so the
+    // strip doesn't cover Home/Files/Settings content. STRIP_H is now a
+    // file-scope constant (see top of file) so makeSettingsPage() can
+    // reference the same value.
+
+    // Shift tabview content down so the strip fits above.
+    lv_obj_set_pos (tv, 0, STRIP_H);
+    lv_obj_set_size(tv, LCD_W, LCD_H - STRIP_H);
+
+    lv_obj_t* strip = lv_obj_create(scr);
+    lv_obj_remove_style_all(strip);
+    lv_obj_set_size(strip, LCD_W, STRIP_H);
+    lv_obj_set_pos (strip, 0, 0);
+    lv_obj_set_style_bg_color(strip, lvhex(C_SURFACE), 0);
+    lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_side(strip, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(strip, 1, 0);
+    lv_obj_set_style_border_color(strip, lvhex(C_LINE), 0);
+    lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+
+    static lv_obj_t* s_manualBtns  [3] = { nullptr };
+    static lv_obj_t* s_manualLbls  [3] = { nullptr };
+    static lv_obj_t* s_manualUnder [3] = { nullptr };
+    const char* iconChars [3] = { LV_SYMBOL_HOME, LV_SYMBOL_FILE, LV_SYMBOL_SETTINGS };
+    // Bug-hunt R1: "Set" was an accidental truncation ("Set" reads as the
+    // verb, not "Settings"). Full word fits inside btnW=110 at Montserrat
+    // 16 (icon ~14 + 2 spaces + "Settings" ~68 = ~92 px).
+    const char* labels    [3] = { "Home", "Files", "Settings" };
+    const int stripInner = LCD_W - 2 * SAFE_X;
+    const int btnW = stripInner / 3;
+
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t* btn = lv_btn_create(strip);
+        lv_obj_remove_style_all(btn);
+        lv_obj_set_size(btn, btnW, STRIP_H - 4);
+        lv_obj_set_pos(btn, SAFE_X + i * btnW, 2);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, [](lv_event_t* e) {
+            int idx = (int)(intptr_t)lv_event_get_user_data(e);
+            if (s_tabView) lv_tabview_set_active(s_tabView, idx, LV_ANIM_OFF);
+        }, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        s_manualBtns[i] = btn;
+
+        // Label — pinned Montserrat 16, static text, no state variations.
+        lv_obj_t* lbl = lv_label_create(btn);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%s  %s", iconChars[i], labels[i]);
+        lv_label_set_text(lbl, buf);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_letter_space(lbl, 0, 0);
+        lv_obj_set_style_text_color(lbl, lvhex(C_MUTED), 0);
+        lv_obj_center(lbl);
+        s_manualLbls[i] = lbl;
+
+        // Bottom underline that lights on the active tab.
+        lv_obj_t* u = lv_obj_create(btn);
+        lv_obj_remove_style_all(u);
+        lv_obj_set_size(u, btnW - 20, 3);
+        lv_obj_align(u, LV_ALIGN_BOTTOM_MID, 0, -2);
+        lv_obj_set_style_bg_opa(u, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_color(u, lvhex(C_ACCENT), 0);
+        lv_obj_set_style_radius(u, 2, 0);
+        s_manualUnder[i] = u;
+    }
+
+    auto syncStrip = [&]() {
+        int active = lv_tabview_get_tab_active(s_tabView);
+        for (int i = 0; i < 3; i++) {
+            bool on = (i == active);
+            if (s_manualLbls[i]) {
+                lv_obj_set_style_text_color(s_manualLbls[i],
+                    lvhex(on ? C_TEXT : C_MUTED), 0);
+            }
+            if (s_manualUnder[i]) {
+                lv_obj_set_style_bg_opa(s_manualUnder[i],
+                    on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            }
+        }
+    };
+
+    // Reset Settings paging to page 0 + repaint strip whenever the
+    // tabview's active tab changes.
     lv_obj_add_event_cb(tv, [](lv_event_t*){
         settingsShowPage(0);
+        int active = lv_tabview_get_tab_active(s_tabView);
+        for (int i = 0; i < 3; i++) {
+            if (s_manualLbls[i]) {
+                lv_obj_set_style_text_color(s_manualLbls[i],
+                    lvhex(i == active ? C_TEXT : C_MUTED), 0);
+            }
+            if (s_manualUnder[i]) {
+                lv_obj_set_style_bg_opa(s_manualUnder[i],
+                    i == active ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            }
+        }
     }, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    // "Italic-Arial" Files tab (v5, final take):
-    // Confirmed from a photo of the running device — "Files" renders in
-    // a heavier / skewed font vs "Home"/"Settings" the moment it becomes
-    // the checked tab. Every previous fix styled the tab_bar or the tab
-    // button. The label INSIDE the button carries its OWN text_font
-    // (LVGL 9 creates it that way in lv_tabview_add_tab) and the theme
-    // sets that label's font_large in the checked state. That's what
-    // stretches the glyphs.
-    //   Fix: for each direct button child of the tab_bar, find its label
-    //   child (should be exactly one) and pin text_font + letter_space +
-    //   line_space + text_opa on THAT LABEL across every state.
-    //   Also pin the button's own font + transform (belt-and-braces),
-    //   pad it so the "Settings" glyph doesn't run off the right edge.
-    {
-      uint32_t n = lv_obj_get_child_count(tabBar);
-      for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t* btn = lv_obj_get_child(tabBar, i);
-        if (!btn) continue;
-        for (lv_state_t st : { (lv_state_t)LV_STATE_DEFAULT,
-                               (lv_state_t)LV_STATE_CHECKED,
-                               (lv_state_t)LV_STATE_PRESSED,
-                               (lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED),
-                               (lv_state_t)LV_STATE_FOCUSED,
-                               (lv_state_t)LV_STATE_FOCUS_KEY }) {
-          lv_obj_set_style_text_font(btn, &lv_font_montserrat_16, st);
-          lv_obj_set_style_text_letter_space(btn, 0, st);
-          lv_obj_set_style_text_line_space (btn, 0, st);
-          lv_obj_set_style_text_opa(btn, LV_OPA_COVER, st);
-          lv_obj_set_style_transform_scale_x(btn, 256, st);
-          lv_obj_set_style_transform_scale_y(btn, 256, st);
-          lv_obj_set_style_transform_pivot_x(btn, 0, st);
-          lv_obj_set_style_transform_pivot_y(btn, 0, st);
-          lv_obj_set_style_pad_hor(btn, 4, st);
-          lv_obj_set_style_pad_ver(btn, 0, st);
-          lv_obj_set_style_anim_duration(btn, 0, st);
+    syncStrip();  // initial paint (tab 0 active)
+
+    // Swipe-up on the tabview brings the clock back.
+    lv_obj_add_event_cb(tv, [](lv_event_t* e){
+        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+        lv_indev_t* indev = lv_indev_active();
+        if (!indev) return;
+        lv_dir_t d = lv_indev_get_gesture_dir(indev);
+        if (d == LV_DIR_TOP && !watchUiClockVisible()) watchUiShowClock();
+    }, LV_EVENT_GESTURE, nullptr);
+
+    // Settings-paging gesture: attach on tabview so we run BEFORE the
+    // built-in class handler. On Settings tab, LEFT advances page, RIGHT
+    // retreats page (when > 0). RIGHT on page 0 falls through so the
+    // tabview's own handler jumps back to Files. lv_event_stop_processing
+    // prevents the tabview class handler from running when we consume.
+    lv_obj_add_event_cb(tv, [](lv_event_t* e){
+        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
+        if (lv_tabview_get_tab_active(s_tabView) != 2) return;  // only on Settings
+        lv_indev_t* indev = lv_indev_active();
+        if (!indev) return;
+        lv_dir_t d = lv_indev_get_gesture_dir(indev);
+        if (d == LV_DIR_LEFT) {
+            if (s_settingsPage < SETTINGS_PAGE_COUNT - 1) {
+                settingsShowPage(s_settingsPage + 1);
+            }
+            lv_indev_wait_release(indev);
+            lv_event_stop_processing(e);
+        } else if (d == LV_DIR_RIGHT) {
+            if (s_settingsPage > 0) {
+                settingsShowPage(s_settingsPage - 1);
+                lv_indev_wait_release(indev);
+                lv_event_stop_processing(e);
+            }
+            // else: page 0 + right swipe → let tabview jump back to Files
         }
-        // Reach into the button and pin the LABEL widget's font too — this
-        // is the piece every earlier pass missed.
-        uint32_t cc = lv_obj_get_child_count(btn);
-        for (uint32_t j = 0; j < cc; j++) {
-          lv_obj_t* lbl = lv_obj_get_child(btn, j);
-          if (!lbl) continue;
-          for (lv_state_t st : { (lv_state_t)LV_STATE_DEFAULT,
-                                 (lv_state_t)LV_STATE_CHECKED,
-                                 (lv_state_t)LV_STATE_PRESSED,
-                                 (lv_state_t)(LV_STATE_CHECKED | LV_STATE_PRESSED),
-                                 (lv_state_t)LV_STATE_FOCUSED }) {
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, st);
-            lv_obj_set_style_text_letter_space(lbl, 0, st);
-            lv_obj_set_style_text_line_space (lbl, 0, st);
-            lv_obj_set_style_text_opa(lbl, LV_OPA_COVER, st);
-            lv_obj_set_style_transform_scale_x(lbl, 256, st);
-            lv_obj_set_style_transform_scale_y(lbl, 256, st);
-          }
-        }
-      }
-    }
+    }, LV_EVENT_GESTURE, nullptr);
 
     // Toast on lv_layer_top() so watchUiFlash() from any tab is visible.
     s_flashLbl = lv_label_create(lv_layer_top());

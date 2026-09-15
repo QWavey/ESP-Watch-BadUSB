@@ -1,10 +1,22 @@
 #include "BTManager.h"
 #include <BLEServer.h>
 #include <BLE2902.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 BLEScan* pBLEScan;
 std::vector<String> foundBTDevices;
 static volatile bool btScanning = false;
+
+// Bug-hunt round 10 fix: foundBTDevices was written from the NimBLE stack
+// task (MyAdvertisedDeviceCallbacks::onResult) and read/cleared from the
+// main task (scanBT clears, isBTDevicePresent iterates, Ducky IF_BT_PRESENT
+// calls the same). A push_back reallocation while another task walked the
+// vector faulted on the freed backing store. Guard every access.
+static SemaphoreHandle_t _btDevMutex = nullptr;
+static void _btDevMutexEnsure() {
+    if (!_btDevMutex) _btDevMutex = xSemaphoreCreateMutex();
+}
 
 BLEServer *pServer = NULL;
 BLECharacteristic * pTxCharacteristic = NULL;
@@ -44,7 +56,11 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice advertisedDevice) {
         String name = advertisedDevice.getName().c_str();
         if (name.length() > 0) {
-            foundBTDevices.push_back(name);
+            _btDevMutexEnsure();
+            if (_btDevMutex && xSemaphoreTake(_btDevMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                foundBTDevices.push_back(name);
+                xSemaphoreGive(_btDevMutex);
+            }
         }
     }
 };
@@ -161,7 +177,11 @@ void scanBT() {
     // Watch port: was pBLEScan->start(5, false) — synchronous 5s block.
     // Cut to 2 s so the main loop isn't frozen for a full 5 s cycle when
     // BT discovery is on. Still plenty to catch nearby advertising devices.
-    foundBTDevices.clear();
+    _btDevMutexEnsure();
+    if (_btDevMutex && xSemaphoreTake(_btDevMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        foundBTDevices.clear();
+        xSemaphoreGive(_btDevMutex);
+    }
     Serial.println("Scanning for BT devices...");
     btScanning = true;
     BLEScanResults* foundDevices = pBLEScan->start(2, false);
@@ -178,7 +198,16 @@ bool btScanInProgress() {
 }
 
 bool isBTDevicePresent(String name) {
-    for (String device : foundBTDevices) {
+    // Bug-hunt round 10 fix: was walking foundBTDevices without the mutex
+    // while the BLE task could push_back mid-iteration -> heap corruption
+    // when the vector reallocated its backing store. Snapshot under lock.
+    _btDevMutexEnsure();
+    std::vector<String> snap;
+    if (_btDevMutex && xSemaphoreTake(_btDevMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        snap = foundBTDevices;
+        xSemaphoreGive(_btDevMutex);
+    }
+    for (const String& device : snap) {
         if (device.indexOf(name) != -1) return true;
     }
     return false;

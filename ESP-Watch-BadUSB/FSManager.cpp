@@ -261,31 +261,58 @@ bool saveScript(String filename, String content) {
 
   String filePath = String(DIR_SCRIPTS) + "/" + filename;
 
-  if (SD.exists(filePath)) {
-    SD.remove(filePath);
-  }
+  // Bug-hunt round C-10: power-loss safety. The prior "remove then write"
+  // sequence destroyed the previous copy of the script BEFORE we had the
+  // new bytes on flash, so a power drop mid-write (SD unplug, brown-out,
+  // wearer holding the button that reboots the ESP) left the file empty
+  // AND the old content gone. Now: write to a sibling ".tmp" first, then
+  // remove the original + rename over it. A power drop mid-write leaves
+  // the original intact and only a stray .tmp behind (harmless — the
+  // ".txt" filter in loadAvailableScripts hides it).
+  String tmpPath = filePath + ".tmp";
+  if (SD.exists(tmpPath)) SD.remove(tmpPath);   // clean any stale tmp
 
-  File file = SD.open(filePath, FILE_WRITE);
+  File file = SD.open(tmpPath, FILE_WRITE);
   if (!file) {
-    Serial.println("Failed to create script file: " + filePath);
+    Serial.println("Failed to create script tmp file: " + tmpPath);
     lastError = "Failed to save script: " + filename;
     errorCount++;
     return false;
   }
 
   size_t bytesWritten = file.print(content);
+  file.flush();
   file.close();
 
-  if (bytesWritten > 0) {
-    Serial.println("Script saved: " + filename + " (" + String(bytesWritten) + " bytes)");
-    loadAvailableScripts();
-    return true;
-  } else {
-    Serial.println("Failed to write script: " + filename);
+  // Accept a legit empty save (content == ""), but only when the caller
+  // actually asked for an empty payload — mismatched lengths mean the write
+  // was truncated, so keep the old file and bail.
+  if (bytesWritten != content.length()) {
+    Serial.println("Failed to write script: " + filename +
+                   " (wrote " + String(bytesWritten) + "/" +
+                   String(content.length()) + " bytes)");
     lastError = "Failed to write script: " + filename;
     errorCount++;
+    SD.remove(tmpPath);
     return false;
   }
+
+  // Atomic-ish swap: drop the old file, then rename tmp over the final
+  // path. A power drop between remove + rename leaves the tmp on disk —
+  // recovery is manual (rename it back), but the WORST case never nukes
+  // the original without a fully-flushed replacement waiting on flash.
+  if (SD.exists(filePath)) SD.remove(filePath);
+  if (!SD.rename(tmpPath, filePath)) {
+    Serial.println("Failed to rename tmp -> final: " + filePath);
+    lastError = "Failed to finalize script: " + filename;
+    errorCount++;
+    SD.remove(tmpPath);
+    return false;
+  }
+
+  Serial.println("Script saved: " + filename + " (" + String(bytesWritten) + " bytes)");
+  loadAvailableScripts();
+  return true;
 }
 
 bool deleteScript(String filename) {

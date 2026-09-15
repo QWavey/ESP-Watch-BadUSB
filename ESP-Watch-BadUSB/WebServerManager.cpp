@@ -843,7 +843,12 @@ $('#go').addEventListener('click', async () => {
   });
   server.on("/api/dead/hosts", []() {
     auto hosts = g_deadnet.getHosts();
-    DynamicJsonDocument doc(8192);
+    // Bug-hunt round 3 fix: sized to fit MAX_HOSTS (64) fully populated
+    // with a resolved hostname. Per-entry cost in v6 ArduinoJson is
+    // ~JSON_OBJECT_SIZE(4) + string pool for ip(16) + mac(18) + host(<=48).
+    // 64 * ~180 = 11.5 KB. Was 8 KB and silently truncated once a busy
+    // /24 populated all 64 slots, leaving the dashboard host list empty.
+    DynamicJsonDocument doc(16384);
     JsonArray arr = doc.to<JsonArray>();
     for (auto& h : hosts) {
       JsonObject o = arr.createNestedObject();
@@ -887,6 +892,18 @@ $('#go').addEventListener('click', async () => {
     int32_t  tz    = doc["tz_seconds"].as<int32_t>(); // local offset from UTC
     if (epoch < 1700000000ULL) {                       // sanity: pre-2023 = bogus
       server.send(400, "application/json", "{\"ok\":false,\"error\":\"epoch too small\"}");
+      return;
+    }
+    // Bug-hunt round 5 fix: reject bogus epoch (>2100) and out-of-range tz.
+    // Without this a malformed browser call (or a compromised client) could
+    // shove e.g. epoch=UINT64_MAX / tz=INT32_MAX into NVS, and the on-screen
+    // clock face would render as garbage forever until the user re-syncs.
+    if (epoch > 4102444800ULL) {                       // >2100-01-01
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"epoch too large\"}");
+      return;
+    }
+    if (tz < -43200 || tz > 50400) {                   // UTC-12 .. UTC+14
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"tz_seconds out of range\"}");
       return;
     }
     preferences.putULong64("clock_epoch",   epoch);

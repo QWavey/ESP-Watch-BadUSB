@@ -19,6 +19,17 @@ void setupAP() {
   // on this ESP32-S3 with modern phones. Every richer setup we tried
   // (WIFI_AP_STA + setTxPower + setSleep + channel/hidden/max args)
   // produced AP_STOP bounces or auth failures. Vanilla wins.
+  //
+  // Bug-hunt round 9 fix: if captive DNS is already up (e.g. a /api/
+  // toggle-wifi off→on cycle without an intermediate stopAP, or a
+  // factory reset that re-runs setupAP), calling captiveDNS.start(53,...)
+  // again tries to bind an already-open UDP socket. DNSServer silently
+  // fails, we leak the second attempt and never re-arm the flag. Stop
+  // the previous instance first so start() sees a fresh socket.
+  if (captivePortalUp) {
+    captiveDNS.stop();
+    captivePortalUp = false;
+  }
   WiFi.mode(WIFI_AP);
 
   // Web-crash mitigation: cap softAP to 4 stations (default). Above that,

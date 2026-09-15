@@ -982,7 +982,18 @@ void Deadnet::stopAttack() {
     auto wait = [](TaskHandle_t* h) {
         uint32_t start = millis();
         while (*h && (millis() - start) < 3000) vTaskDelay(pdMS_TO_TICKS(20));
-        if (*h) { vTaskDelete(*h); *h = nullptr; }
+        // Bug-hunt round 8 race fix: previous fallback was
+        //   if (*h) { vTaskDelete(*h); *h = nullptr; }
+        // If the task self-completed between the `*h` check and the
+        // vTaskDelete call, it would have nulled *h -> we'd pass nullptr
+        // to vTaskDelete, which is documented to delete the CALLING task
+        // (this HTTP handler on the main loop task). Snapshot the handle,
+        // null the slot first, then only delete if the snapshot is non-null.
+        TaskHandle_t t = *h;
+        if (t) {
+            *h = nullptr;
+            vTaskDelete(t);
+        }
     };
     wait(&_attackTaskHandle);
     wait(&_scanTaskHandle);
