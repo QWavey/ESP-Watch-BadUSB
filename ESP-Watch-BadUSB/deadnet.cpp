@@ -859,7 +859,11 @@ void Deadnet::dnsSpoofTask(void* pv) {
         }
 
         int packetSize = udp.parsePacket();
-        if (packetSize > 0 && packetSize <= sizeof(buf)) {
+        // Bug-hunt round 4: cap the readable size so the response
+        // construction below (appends 16 bytes for the fake A record)
+        // can't overflow buf[512]. A 500-byte DNS query + 16 append =
+        // 516 out of 512.
+        if (packetSize > 0 && packetSize <= (int)sizeof(buf) - 16) {
             int len = udp.read(buf, sizeof(buf));
             
             // Basic DNS query check (at least 12 bytes header)

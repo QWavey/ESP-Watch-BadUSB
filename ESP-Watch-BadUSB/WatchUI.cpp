@@ -478,16 +478,22 @@ static void settingsShowPage(int p) {
 // dispatch so the tabview doesn't ALSO react to the same swipe.
 static void settingsGestureCb(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+    // Bug-hunt round 15: null-guard lv_indev_active(). In a gesture
+    // callback it's essentially always non-null, but a synthetic
+    // event dispatch (or a re-entry during shutdown) could pass a
+    // null indev and deref would crash.
+    lv_indev_t* indev = lv_indev_active();
+    if (!indev) return;
+    lv_dir_t d = lv_indev_get_gesture_dir(indev);
     if (d == LV_DIR_LEFT) {
         if (s_settingsPage < SETTINGS_PAGE_COUNT - 1) {
             settingsShowPage(s_settingsPage + 1);
         }
-        lv_indev_wait_release(lv_indev_active());  // never let tabview see it
+        lv_indev_wait_release(indev);  // never let tabview see it
     } else if (d == LV_DIR_RIGHT) {
         if (s_settingsPage > 0) {
             settingsShowPage(s_settingsPage - 1);
-            lv_indev_wait_release(lv_indev_active());  // consumed, don't jump tabs
+            lv_indev_wait_release(indev);  // consumed, don't jump tabs
         }
         // else: page 0 and swiping right → let tabview handle it (back to Files)
     }
