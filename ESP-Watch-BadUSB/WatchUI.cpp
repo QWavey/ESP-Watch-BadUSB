@@ -82,6 +82,11 @@ static const uint32_t C_LED_OFF   = 0x101010;
 
 static const int LCD_W = LCD_WIDTH;
 static const int LCD_H = LCD_HEIGHT;
+// Curvy AMOLED safe-area inset — the Waveshare 2.06" panel has ~50 px
+// rounded corners. Text drawn flush to any edge gets sliced. Every full-
+// width row now uses (LCD_W - 2*SAFE_X) so labels stay inside the visible
+// circle. Applied inside the tab content, not the tab bar.
+static const int SAFE_X = 24;
 
 static lv_color_t lvhex(uint32_t rgb) { return lv_color_hex(rgb & 0xFFFFFF); }
 
@@ -128,7 +133,9 @@ static lv_obj_t* makeSwitchRow(lv_obj_t* parent, const char* icon,
                                lv_event_cb_t cb, int idx) {
     lv_obj_t* row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LCD_W, 60);
+    // Curvy safe-area — see SAFE_X comment. Applies to every settings row
+    // so the switch on the right doesn't clip past the rounded corner.
+    lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 60);
     lv_obj_set_scroll_dir(row, LV_DIR_NONE);
     lv_obj_set_style_pad_hor(row, 14, 0);
     lv_obj_set_style_pad_ver(row, 8, 0);
@@ -178,7 +185,8 @@ static lv_obj_t* makeActionRow(lv_obj_t* parent, const char* icon,
                                bool danger, lv_event_cb_t cb) {
     lv_obj_t* row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LCD_W, 70);
+    // Curvy safe-area for Reboot/Reset/Wipe/Brick action rows too.
+    lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 70);
     lv_obj_set_scroll_dir(row, LV_DIR_NONE);
     lv_obj_set_style_pad_hor(row, 14, 0);
     lv_obj_set_style_pad_ver(row, 10, 0);
@@ -387,7 +395,11 @@ static void buildFilesTab(lv_obj_t* tab) {
     s_filesList = lv_obj_create(tab);
     lv_obj_remove_style_all(s_filesList);
     lv_obj_set_size(s_filesList, LCD_W, LV_PCT(100));
-    lv_obj_set_style_pad_all(s_filesList, 0, 0);
+    // Curvy safe-area: leave a horizontal gutter so each row (also inset
+    // now) sits inside the visible circle.
+    lv_obj_set_style_pad_left(s_filesList, SAFE_X, 0);
+    lv_obj_set_style_pad_right(s_filesList, SAFE_X, 0);
+    lv_obj_set_style_pad_ver(s_filesList, 0, 0);
     lv_obj_set_style_bg_color(s_filesList, lvhex(C_BG), 0);
     lv_obj_set_flex_flow(s_filesList, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_filesList, LV_FLEX_ALIGN_START,
@@ -966,7 +978,10 @@ void watchUiSetFileList(const std::vector<String>& names,
 
         lv_obj_t* row = lv_obj_create(s_filesList);
         lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, LCD_W, 68);
+        // Curvy safe-area: row width and horizontal padding fit inside the
+        // rounded-corner visible area so file names + action buttons don't
+        // clip at the panel edge.
+        lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 68);
         lv_obj_set_style_pad_hor(row, 8, 0);
         lv_obj_set_style_pad_ver(row, 8, 0);
         lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);

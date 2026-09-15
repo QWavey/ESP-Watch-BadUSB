@@ -12,6 +12,7 @@
 #include <map>
 #include <algorithm>
 #include <Preferences.h>
+#include <esp_partition.h>     // Watch port: flash-time clock blob at boot
 
 #include "Config.h"           // brings in SD_MMC + `#define SD SD_MMC` shim
 #include "GlobalState.h"
@@ -536,6 +537,38 @@ void setup() {
     }
   }
   // ------------------------------------------------------------------------
+
+  // ---- Flash-time clock blob ------------------------------------------
+  // The WebFlasher writes a tiny binary at the head of the coredump
+  // partition (offset 0x3F0000) containing:
+  //   magic  : uint32  0xC10CBA5E ("clockbase")
+  //   epoch  : uint64  UTC seconds at the moment of flash
+  //   tz     : int32   local timezone offset in seconds
+  //   pad    : uint32
+  // If the magic matches we treat the epoch as the synchronised time,
+  // then erase the blob so subsequent boots don't keep resetting the
+  // clock to flash-day. If the wearer later opens the dashboard, that
+  // path (/api/set-time) overwrites the pref with a fresher browser
+  // clock — flash-time is just the bootstrap so HH:MM is right OUT of
+  // the box.
+  {
+    const esp_partition_t* p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, NULL);
+    if (p) {
+      struct __attribute__((packed)) { uint32_t magic; uint64_t epoch;
+                                       int32_t tz; uint32_t pad; } blob = {};
+      if (esp_partition_read(p, 0, &blob, sizeof(blob)) == ESP_OK
+          && blob.magic == 0xC10CBA5EU
+          && blob.epoch >= 1700000000ULL) {
+        Serial.printf("[BOOT] flash-time blob: epoch=%llu tz=%d\n",
+                      (unsigned long long)blob.epoch, (int)blob.tz);
+        preferences.putULong64("clock_epoch",   blob.epoch);
+        preferences.putLong   ("clock_tz_secs", blob.tz);
+        preferences.putULong  ("clock_sync_ms", millis());
+        esp_partition_erase_range(p, 0, 4096);   // one-shot; clear now.
+      }
+    }
+  }
 
   // ---- First-boot "all user toggles OFF" migration --------------------
   // Deliberately DOES NOT touch silent_boot or am_hid — those affect USB
