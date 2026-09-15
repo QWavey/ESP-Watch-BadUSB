@@ -479,20 +479,13 @@ static void buildSettingsTab(lv_obj_t* tab) {
     // Independent from Files-tab star, which sets *which* script is queued.
     makeSwitchRow(tab, LV_SYMBOL_PLAY,       "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
 
-    // DeadNet — LAN attack. LVGL's built-in Montserrat font doesn't ship the
-    // skull glyph (U+1F480), so we use LV_SYMBOL_WARNING (⚠) — visually the
-    // same "danger" cue, no font addition needed. The label carries the
-    // skull glyph as UTF-8; the row layout still lands correctly whether
-    // that renders or falls back to the placeholder box.
-    makeSwitchRow(tab, LV_SYMBOL_WARNING,    "\xE2\x98\xA0 DeadNet", false, settingSwitchCb, SET_DEADNET);
-    // LAN-status label sits under the DeadNet row so the wearer sees
-    // whether the switch can actually do anything.
-    s_lanStatusLbl = lv_label_create(tab);
-    lv_label_set_text(s_lanStatusLbl, "LAN: unknown");
-    lv_obj_set_style_text_color(s_lanStatusLbl, lvhex(C_MUTED), 0);
-    lv_obj_set_style_text_font(s_lanStatusLbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_pad_hor(s_lanStatusLbl, 14, 0);
-    lv_obj_set_style_pad_ver(s_lanStatusLbl, 2, 0);
+    // DeadNet row removed from the AMOLED settings tab per user feedback.
+    // The web dashboard is where DeadNet lives — it needs the risky-mode
+    // acknowledge checkbox for DEAUTH/SNIFF, which is impractical on a
+    // wrist-sized screen. AMOLED settings stays lean.
+    // s_lanStatusLbl is left declared but never created; watchUiSetLan
+    // Connected() and watchUiSetDeadnetToggle() no-op when their target
+    // labels/switches are null.
 
     // Section: Actions
     makeActionRow(tab, LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
@@ -559,13 +552,21 @@ void watchUiBegin() {
     {
       const auto pin = [&](lv_state_t st) {
         lv_style_selector_t sel = LV_PART_ITEMS | st;
+        // Italic-Arial-looking tab-text stretch on tap: LVGL 9's default
+        // theme animates transform_scale AND swaps to a slightly larger
+        // font_font_large on checked. Pin everything that can change so
+        // the tab render is byte-identical in every state.
         lv_obj_set_style_transform_scale_x(tabBar, 256, sel);
         lv_obj_set_style_transform_scale_y(tabBar, 256, sel);
+        lv_obj_set_style_transform_pivot_x(tabBar, 0, sel);
+        lv_obj_set_style_transform_pivot_y(tabBar, 0, sel);
         lv_obj_set_style_text_letter_space(tabBar, 0, sel);
+        lv_obj_set_style_text_line_space (tabBar, 0, sel);
         lv_obj_set_style_text_font(tabBar, &lv_font_montserrat_18, sel);
         lv_obj_set_style_pad_hor(tabBar, 12, sel);
         lv_obj_set_style_pad_ver(tabBar, 0, sel);
         lv_obj_set_style_anim_duration(tabBar, 0, sel);
+        lv_obj_set_style_text_opa(tabBar, LV_OPA_COVER, sel);
       };
       pin((lv_state_t)LV_STATE_DEFAULT);
       pin((lv_state_t)LV_STATE_CHECKED);
@@ -821,12 +822,11 @@ void watchUiTick() {
     // gives touch/server/USB more headroom. The old forced full-screen
     // invalidate every 300 ms is gone — it caused a repaint storm and was
     // only added as a diagnostic that never proved anything.
-    // Watch port perf: rate-limit lv_task_handler to 5 ms so touch tracking
-    // stays sharp — LVGL's own scheduler still respects LV_DEF_REFR_PERIOD.
-    // The pass early-outs cheaply when nothing is dirty (~50 µs), so 5 ms
-    // is nearly free compared to the old 10 ms cap.
+    // Watch port perf: rate-limit lv_task_handler to 3 ms so touch tracking
+    // stays sharp — LVGL's own scheduler still respects LV_DEF_REFR_PERIOD
+    // (15 ms). The pass early-outs cheaply when nothing is dirty (~50 µs).
     static unsigned long s_lastHandler = 0;
-    if (now - s_lastHandler < 5) return;
+    if (now - s_lastHandler < 3) return;
     s_lastHandler = now;
     lv_task_handler();
 

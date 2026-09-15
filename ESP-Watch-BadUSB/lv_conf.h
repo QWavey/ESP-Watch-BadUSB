@@ -94,10 +94,12 @@
  *====================*/
 
 /** Default display refresh, input device read and animation step period. */
-/* Watch port perf: 33 ms = 30 FPS. AMOLED can do 60 FPS easily and the QSPI
- * flush is CPU-cheap because the buffer sits in PSRAM; drop to 20 ms so touch
- * tracking feels sharper without eating measurable extra CPU. */
-#define LV_DEF_REFR_PERIOD  20      /**< [ms] */
+/* Watch port perf: was 33ms → 20ms → now 15ms (~66Hz). LVGL's refresh loop
+ * early-outs cheap when nothing's dirty; the QSPI flush hits ~2-3 ms for
+ * partial redraws with the 60-row PSRAM buffer. 15 ms leaves ample budget
+ * for touch → visible-move latency and makes drags/scrolls feel much
+ * closer to the finger. */
+#define LV_DEF_REFR_PERIOD  15      /**< [ms] */
 
 /** Default Dots Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  * (Not so important, you can adjust it to modify default sizes and spaces.) */
