@@ -266,6 +266,11 @@ int32_t tud_msc_read10_cb(uint8_t /*lun*/, uint32_t lba, uint32_t offset,
   if (offset != 0)      return -1;                 // partial-sector unsupported
   if (bufsize % SS != 0) return -1;
   uint32_t sectors = bufsize / SS;
+  // Bug-hunt #3: zero-length READ10 must return 0, not fall through the
+  // sub-region math where "sectors - sectors == 0" makes lba > check pass
+  // for lba == mscSubSectors and translate to (mscBaseSector + mscSubSectors)
+  // — one sector past the sub-region window.
+  if (sectors == 0) return 0;
   // v4.8: sub-region translation - bound-check + offset into real SD.
   // v4.11 SECURITY: integer-overflow-safe bounds check. `lba + sectors` can
   // wrap to a small value in uint32 when a malicious host sends
@@ -289,6 +294,8 @@ int32_t tud_msc_write10_cb(uint8_t /*lun*/, uint32_t lba, uint32_t offset,
   if (offset != 0)      return -1;
   if (bufsize % SS != 0) return -1;
   uint32_t sectors = bufsize / SS;
+  // Bug-hunt #3: same zero-length early-exit as read10 above.
+  if (sectors == 0) return 0;
   // v4.8: sub-region translation - refuse writes past the sub-region so a
   // host format can't reach into the primary partition and clobber files.
   // v4.11 SECURITY: overflow-safe (see read10 comment).

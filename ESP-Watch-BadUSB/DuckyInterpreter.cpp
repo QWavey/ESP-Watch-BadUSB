@@ -11,6 +11,19 @@
 #include <USB.h>
 #include "esp32-hal-tinyusb.h"   // v4.29: tud_mounted() for the real
                                   //        WAIT_FOR_EVENT USB_CONNECTED wait
+#include "WatchUI.h"              // watchUiScreenSleep for real SHUTDOWN
+
+// Watch port bug-hunt #2 fix: ESP.restart() on the ESP32-S3 with USB-
+// Serial/JTAG leaves the ROM stub half-initialised and the chip boots
+// into download mode instead of the app. Every DuckyInterpreter reboot
+// site (REBOOT, ATTACKMODE change, wifi_change scripted reboot, etc.)
+// now routes through this helper — usb_persist_restart(RESTART_NO_
+// PERSIST) shuts TinyUSB cleanly before esp_restart(). Also flush NVS
+// via preferences.end() first so pending pref writes survive.
+static inline void duckySafeRestart() {
+  preferences.end();
+  usb_persist_restart(RESTART_NO_PERSIST);
+}
 
 struct LoopState {
   int startLine;
@@ -816,7 +829,7 @@ void executeScript(const String& script) {
         Serial.println("Resume script saved. Rebooting for USB identity change...");
       }
       delay(500);
-      ESP.restart();
+      duckySafeRestart();
       return; // Never reached
     }
 
@@ -1109,7 +1122,7 @@ void executeScript(const String& script) {
       tud_disconnect();
       delay(600);
       Serial.println("[ATTACKMODE] Rebooting to rebuild USB descriptors...");
-      ESP.restart();
+      duckySafeRestart();
       return; // never reached
     }
     if (defaultDelay > 0) {
@@ -1422,7 +1435,7 @@ void executeCommand(String line) {
     preferences.putBool("am_no_hid_intent", true);
     stopRequested = true;
     delay(300);
-    ESP.restart();
+    duckySafeRestart();
     return;
   }
   if (line == "SOFT_BRICK") {
@@ -1435,7 +1448,7 @@ void executeCommand(String line) {
     preferences.putBool("am_no_hid_intent", true);
     stopRequested = true;
     delay(300);
-    ESP.restart();
+    duckySafeRestart();
     return;
   }
 
@@ -2119,7 +2132,7 @@ void executeCommand(String line) {
   if (line == "REBOOT") {
     Serial.println("Rebooting device...");
     delay(500);
-    ESP.restart();
+    duckySafeRestart();
     return;
   }
 
@@ -2452,7 +2465,7 @@ void executeCommand(String line) {
   }
 
   if (line == "SHUTDOWN") { ESP.deepSleep(0); return; }
-  if (line == "REBOOT") { ESP.restart(); return; }
+  if (line == "REBOOT") { duckySafeRestart(); return; }
   if (line == "DETECT_OS") { detectOS(); return; }
   // v4.4: full alias set. Users can spell any of these however they want.
   if (line == "SELFDESTRUCT"    || line == "SELF_DESTRUCT" ||
@@ -2828,7 +2841,7 @@ void selfDestruct() {
   Serial.println("[DESTRUCT] Complete. Reboot into a bricked state in 2 s.");
   Serial.println("Recover: hold GPIO0, replug, esptool.py write_flash.");
   delay(2000);
-  ESP.restart();   // bootloader now finds no valid app -> stays in ROM
+  duckySafeRestart();   // bootloader now finds no valid app -> stays in ROM
 }
 
 // ============================================================================
@@ -2872,7 +2885,7 @@ void performFactoryReset() {
   preferences.clear();
   preferences.end();
   delay(1500);
-  ESP.restart();
+  duckySafeRestart();
 }
 
 // ============================================================================
@@ -2973,7 +2986,7 @@ void performBehaveBroken() {
   preferences.putBool  ("silent_boot",      false);
 
   delay(1500);
-  ESP.restart();
+  duckySafeRestart();
 }
 
 #include <WiFi.h>

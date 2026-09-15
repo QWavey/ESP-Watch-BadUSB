@@ -21,6 +21,12 @@ void handleFileUpload() {
     if (uploadFilename.indexOf('/') >= 0 || uploadFilename.indexOf('\\') >= 0 ||
         uploadFilename.indexOf("..") >= 0 || uploadFilename.length() == 0) {
       Serial.println("[UPLOAD] Rejected unsafe filename: " + uploadFilename);
+      // Bug-hunt #1: also CLOSE the previous uploadFile so subsequent
+      // UPLOAD_FILE_WRITE chunks — which the ESP32 WebServer library keeps
+      // delivering after START — can't write into whichever file was open
+      // from a prior (possibly aborted) upload. Without this a malicious
+      // upload could tail-append its data to an earlier legitimate file.
+      if (uploadFile) uploadFile.close();
       uploadFilename = "";
       return;
     }
@@ -49,19 +55,23 @@ void handleFileUpload() {
     }
     
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) {
+    // Bug-hunt #1: gate writes on both an open file AND a non-empty
+    // uploadFilename. START clears uploadFilename on reject; without the
+    // second guard a WRITE that arrives after a rejected START still
+    // trickles into whichever file was open before.
+    if (uploadFile && uploadFilename.length() > 0) {
       size_t bytesWritten = uploadFile.write(upload.buf, upload.currentSize);
       if (bytesWritten != upload.currentSize) {
         Serial.println("File write error: " + String(bytesWritten) + " vs " + String(upload.currentSize));
       }
     }
-    
+
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (uploadFile) {
+    if (uploadFile && uploadFilename.length() > 0) {
       uploadFile.flush();
       uploadFile.close();
       Serial.println("File upload complete: " + uploadFilename + " size: " + String(upload.totalSize));
-      
+
       if (uploadFilename.endsWith(".txt")) {
         loadAvailableScripts();
       } else if (uploadFilename.endsWith(".json")) {
