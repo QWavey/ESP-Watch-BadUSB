@@ -777,6 +777,18 @@ $('#go').addEventListener('click', async () => {
       return;
     }
     uint8_t mode = doc["mode"] | ATTACK_MODE_ARP;
+    // Bug-hunt #3: ATTACK_MODE_DNS binds UDP:53. The captive-portal DNS
+    // owns port 53 in AP mode, so the bind silently fails and the DNS
+    // spoof task self-deletes with only a Serial log. Warn the caller
+    // rather than pretending DNS is arming — this matches the actual
+    // behaviour without silently masking user intent.
+    if (mode & ATTACK_MODE_DNS) {
+      // captivePortalUp is file-static in WiFiManager.cpp; the fact that
+      // we ARE in AP mode with our own captive DNS is a firmware-wide
+      // invariant, so we can safely assume port 53 is held. Warn once
+      // per start so it's obvious in Serial that DNS spoof will not run.
+      Serial.println("[/api/dead/start] ATTACK_MODE_DNS requested but the firmware's captive DNS holds port 53 — DNS spoof task will fail to bind and self-exit");
+    }
     std::vector<IPAddress> targets;
     if (doc.containsKey("targets") && doc["targets"].is<JsonArray>()) {
       for (JsonVariant v : doc["targets"].as<JsonArray>()) {

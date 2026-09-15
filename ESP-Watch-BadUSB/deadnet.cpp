@@ -321,9 +321,26 @@ void Deadnet::clearHosts() {
     }
 }
 
+// Bug-hunt #1 fix: sniffer_callback runs on the WiFi task and calls
+// addSniffLog which writes _sniffLogs; /api/dead/sniff reads it from the
+// main task via getSniffedData; original code had NO mutex, so a
+// concurrent push_back + copy could reallocate mid-iteration and crash.
+// Added a dedicated mutex around every _sniffLogs touch.
 static std::vector<Deadnet::SniffedData> _sniffLogs;
+static SemaphoreHandle_t _sniffMutex = nullptr;
+
+static void ensureSniffMutex() {
+    if (!_sniffMutex) _sniffMutex = xSemaphoreCreateMutex();
+}
+
 std::vector<Deadnet::SniffedData> Deadnet::getSniffedData() {
-    return _sniffLogs;
+    std::vector<Deadnet::SniffedData> copy;
+    ensureSniffMutex();
+    if (_sniffMutex && xSemaphoreTake(_sniffMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        copy = _sniffLogs;
+        xSemaphoreGive(_sniffMutex);
+    }
+    return copy;
 }
 
 void Deadnet::addSniffLog(String src, String type, String content) {
@@ -332,12 +349,20 @@ void Deadnet::addSniffLog(String src, String type, String content) {
     d.type = type;
     d.content = content;
     d.timestamp = millis();
-    _sniffLogs.push_back(d);
-    if (_sniffLogs.size() > 50) _sniffLogs.erase(_sniffLogs.begin());
+    ensureSniffMutex();
+    if (_sniffMutex && xSemaphoreTake(_sniffMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        _sniffLogs.push_back(d);
+        if (_sniffLogs.size() > 50) _sniffLogs.erase(_sniffLogs.begin());
+        xSemaphoreGive(_sniffMutex);
+    }
 }
 
 void Deadnet::clearSniffLogs() {
-    _sniffLogs.clear();
+    ensureSniffMutex();
+    if (_sniffMutex && xSemaphoreTake(_sniffMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        _sniffLogs.clear();
+        xSemaphoreGive(_sniffMutex);
+    }
 }
 
 // ─── resolve gateway / BSSID ────────────────────────────────────────────────
@@ -915,6 +940,21 @@ bool Deadnet::startAttack(uint8_t mode, const std::vector<IPAddress>& targets) {
         xSemaphoreGive(_hostsMutex);
     }
 
+    // Bug-hunt #2 fix: sniffer_callback was registered in begin() but the
+    // radio was never put into promiscuous mode, so the callback never
+    // fired and ATTACK_MODE_SNIFF was silently a no-op. Enable promiscuous
+    // when SNIFF is requested, filter to data frames only (management +
+    // control noise would overwhelm the sniff log), and disable on stop
+    // so the STA path returns to normal.
+    if (mode & ATTACK_MODE_SNIFF) {
+        wifi_promiscuous_filter_t f = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
+        esp_wifi_set_promiscuous_filter(&f);
+        esp_err_t pe = esp_wifi_set_promiscuous(true);
+        if (pe != ESP_OK) {
+            Logger::log("Promiscuous enable failed (0x" + String(pe, HEX) + ")", "error");
+        }
+    }
+
     // Launch subnet scan task (lower priority)
     xTaskCreate(subnetScanTask, "dn_scan", 4096, this, 1, &_scanTaskHandle);
     // Launch attack task (slightly higher priority)
@@ -929,8 +969,25 @@ bool Deadnet::startAttack(uint8_t mode, const std::vector<IPAddress>& targets) {
 void Deadnet::stopAttack() {
     if (!_running) return;
     _running = false;
-    // Tasks detect _running==false and self-delete; give them time
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Bug-hunt #4 fix: was a bare 500 ms sleep. If the tasks were mid-
+    // iteration when _running flipped they'd finish, then null the handles.
+    // A rapid stop→start would repopulate the handles first, then the
+    // OLD tasks' cleanup would null the NEW handles - orphan tasks with
+    // no way to stop them. Poll each handle until it self-clears; hard
+    // cap at 3 s in case a task is wedged, then vTaskDelete forcibly.
+    auto wait = [](TaskHandle_t* h) {
+        uint32_t start = millis();
+        while (*h && (millis() - start) < 3000) vTaskDelay(pdMS_TO_TICKS(20));
+        if (*h) { vTaskDelete(*h); *h = nullptr; }
+    };
+    wait(&_attackTaskHandle);
+    wait(&_scanTaskHandle);
+    wait(&_dnsTaskHandle);
+
+    // Bug-hunt #2 pair: turn promiscuous back off so the STA path returns
+    // to normal packet flow. Harmless no-op if it was already disabled.
+    esp_wifi_set_promiscuous(false);
+
     Logger::log("Attack stopped. Total pkts=" + String(_pktCount) +
                 " cycles=" + String(_cycleCount));
 }
