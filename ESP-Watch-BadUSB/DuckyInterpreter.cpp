@@ -20,6 +20,20 @@
 // now routes through this helper — usb_persist_restart(RESTART_NO_
 // PERSIST) shuts TinyUSB cleanly before esp_restart(). Also flush NVS
 // via preferences.end() first so pending pref writes survive.
+// Interpreter tick — pumps LVGL so the persistent RUNNING banner +
+// Stop button state update while a script is executing. Without this,
+// scripts with long DELAYs never render their "running" state (the
+// main loop() task is blocked inside executeScript's DELAY wait).
+// Rate-limited to ~15 ms so per-line CPU cost stays negligible.
+static inline void interpTick() {
+    static unsigned long s_lastLv = 0;
+    unsigned long now = millis();
+    if (now - s_lastLv >= 15) {
+        s_lastLv = now;
+        watchUiTick();
+    }
+}
+
 static inline void duckySafeRestart() {
   preferences.end();
   usb_persist_restart(RESTART_NO_PERSIST);
@@ -167,7 +181,16 @@ void executeScript(const String& script) {
 
   scriptRunning = true;
   stopRequested = false;
+  // Bug-hunt R3: reset scriptPaused too. If a previous script was
+  // stopped externally (physical button, /api/stop, WD, REBOOT) WHILE
+  // paused, none of those paths cleared scriptPaused — only the Home
+  // Stop button did. Next executeScript would launch, land on the
+  // pause-loop `while (scriptPaused && !stopRequested) delay(50);`
+  // at line 1 of the main loop, and hang silently forever. Belt-and-
+  // suspenders reset here guarantees a fresh script starts running.
+  scriptPaused  = false;
   scriptStartTime = millis();
+  if (topLevel) watchUiSetScriptState(1);   // running → wake up Home Stop
   // v4.17: user-toggleable "Blink LED while executing payloads" (Settings).
   // Default ON so behaviour is backwards-compatible. When OFF, hold the LED
   // solid blue for the run instead of the busy blink.
@@ -709,6 +732,14 @@ void executeScript(const String& script) {
   std::vector<String> rowerPayloads;
 
   while (i < lines.size() && !stopRequested) {
+    interpTick();   // every line: pump LVGL so status/banner update
+    // Pause point: if the wearer taps Play while a script is running,
+    // scriptPaused flips to true. Sleep here AND pump LVGL so the
+    // wearer can still tap Continue or Stop.
+    while (scriptPaused && !stopRequested) {
+        interpTick();
+        delay(20);
+    }
     currentLineNum = i + 1;
     String line = lines[i];
     line.trim();
@@ -1127,7 +1158,10 @@ void executeScript(const String& script) {
     }
     if (defaultDelay > 0) {
       unsigned long delayStart = millis();
-      while (millis() - delayStart < (unsigned long)defaultDelay && !stopRequested) delay(10);
+      while (millis() - delayStart < (unsigned long)defaultDelay && !stopRequested) {
+        interpTick();
+        delay(10);
+      }
     }
     i++;
   }
@@ -1139,6 +1173,7 @@ void executeScript(const String& script) {
   if (g_scriptDepth != 0) return;
 
   scriptRunning = false;
+  watchUiSetScriptState(0);   // idle → dim Home Stop button
   if (loggingEnabled) {
     if (stopRequested) logCommand("SCRIPT_STOP", "Stopped at line " + String(currentLineNum));
     else logCommand("SCRIPT_END", "Completed successfully");
@@ -1258,6 +1293,7 @@ void executeCommand(String line) {
           handleLED(); server.handleClient(); comShellLoop();
           extern void pumpButton(); pumpButton();     // v4.26 HIGH #1
           extern void hostLedTick(); hostLedTick();   // v4.26: also mirror lock LEDs during a lock-wait
+          interpTick();                                // bug-hunt blocker #2: keep AMOLED alive during lock-wait
           delay(20);
         }
         return;
@@ -1300,6 +1336,7 @@ void executeCommand(String line) {
       server.handleClient();
       comShellLoop();
       extern void hostLedTick(); hostLedTick();
+      interpTick();               // bug-hunt blocker #2: pump LVGL during button wait
       delay(20);
     }
     g_buttonSuppressStop = prevSuppress;
@@ -1385,6 +1422,7 @@ void executeCommand(String line) {
       handleLED(); server.handleClient(); comShellLoop();
       extern void pumpButton(); pumpButton();   // v4.26 HIGH #1: 10s factory-reset must still fire during this wait
       extern void hostLedTick(); hostLedTick();   // v4.23: pump LED mirror while blocked
+      interpTick();                                // bug-hunt blocker #2: pump AMOLED during scroll-lock change wait
       delay(20);
     }
     return;
@@ -1557,6 +1595,7 @@ void executeCommand(String line) {
       comShellLoop();
       extern void pumpButton(); pumpButton();     // v4.26 HIGH #1: factory-reset + stop-btn during long DELAY
       extern void hostLedTick(); hostLedTick();   // v4.23
+      interpTick();                                // pump LVGL so the RUNNING banner + Stop button stay live
       delay(20);
     }
     currentDelayTotal = 0;
@@ -2230,6 +2269,10 @@ void executeCommand(String line) {
       extern void pumpButton(); pumpButton();
       handleLED(); server.handleClient(); comShellLoop();
       extern void hostLedTick(); hostLedTick();
+      // Bug-hunt blocker #2: pump LVGL so the persistent RUNNING banner
+      // and Stop-button state stay live during a long WAIT_FOR_EVENT wait
+      // (interpTick's 15 ms throttle applies inside).
+      interpTick();
     };
     if (event == "USB_CONNECTED" || event == "USB_MOUNTED" || event == "USB_ATTACHED") {
       while (!tud_mounted() && !stopRequested && (millis() - waitStart) < WAIT_CEILING_MS) {

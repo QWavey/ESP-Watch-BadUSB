@@ -7,6 +7,7 @@
 #include <USB.h>
 #include <USBHIDKeyboard.h>
 #include "esp32-hal-tinyusb.h"   // tud_mounted() for USB.begin() poll (v4.4)
+#include "hal/usb_serial_jtag_ll.h"  // usb_serial_jtag_ll_phy_enable_pad() for post-boot silent
 #include "esp_timer.h"           // esp_timer_get_time() for live CPU busy% (v4.10)
 #include <vector>
 #include <map>
@@ -113,6 +114,7 @@ void hostLedTick() {
 volatile bool g_buttonShortPressed  = false;   // release-edge one-shot (consumer clears)
 bool          g_buttonSuppressStop  = false;   // WAIT_FOR_BUTTON_PRESS sets this
 String        g_buttonHandlerScript = "";      // BUTTON_DEF ... END_BUTTON body
+String        selectedScriptName    = "";      // script tapped in Files → Home Play
 bool          g_buttonHandlerRunning = false;  // reentrancy guard
 
 extern void executeScript(const String& script);
@@ -344,14 +346,20 @@ void setup() {
   // this up is what makes silent actually silent.
   {
     Preferences bootPrefs;
-    bootPrefs.begin("badusb", true);   // read-only
-    // Watch port: DEFAULT to false. On a fresh-erased NVS the Key's original
-    // `true` default made usbBeginSilent() kill the USB PHY pads at every
-    // boot, the host then USB-reset the chip back into ROM, we boot again,
-    // repeat forever. Infinite USB_UART_CHIP_RESET loop confirmed on the
-    // watch via serial log. The user can still enable silent boot via the
-    // AMOLED settings toggle or the web UI.
+    bootPrefs.begin("badusb", false);
+    // First-boot enforced-silent: on a fresh flash (fb_done not yet set)
+    // force silent_boot=true unconditionally so the watch never enumerates
+    // as JTAG on first power-up. Subsequent boots honour whatever the user
+    // set in the AMOLED / web toggle. Set the "done" flag AFTER we arm
+    // silent — a mid-write reset falls back through the same first-boot
+    // path on the next attempt, which is exactly what we want.
+    bool firstBootDone = bootPrefs.getBool("fb_done", false);
     bool silent = bootPrefs.getBool("silent_boot", false);
+    if (!firstBootDone) {
+      silent = true;
+      bootPrefs.putBool("silent_boot", true);
+      bootPrefs.putBool("fb_done",     true);
+    }
     bootPrefs.end();
     if (silent) {
       usbBeginSilent();      // disables USB PHY pads before any enumeration
@@ -606,12 +614,10 @@ void setup() {
   // clock-only loop. Placed AFTER watchUiBegin() so the clock is live,
   // and BEFORE any WiFi/BT/USB setup so a bricked unit doesn't beacon.
   if (preferences.getBool("bricked", false)) {
-    Serial.println("[BOOT] bricked=true — clock-only mode until reflash");
-    if (!watchUiClockVisible()) watchUiShowClock();
-    watchUiFlash("Firmware bricked — reflash to recover");
+    Serial.println("[BOOT] bricked=true — blackscreen until reflash");
+    watchUiEnterBrickBlackscreen();   // wipes UI, paints pure black
     for (;;) {
       watchUiTick();
-      watchUiSetClockSeconds(millis() / 1000);
       delay(50);
     }
   }
@@ -694,18 +700,23 @@ void setup() {
   logDebug("Active language: " + currentLanguage);
   logDebug("Keymap entries: " + String(currentKeymap.size()));
 
-  // Autostart gate — the wearer must have flipped "Autostart" in Settings
-  // for a boot script to actually run at boot. Even when boot_script is
-  // set (via Files-tab star / SET_BOOT_SCRIPT / web UI), we only arm
-  // bootModeEnabled when autostart_on is true.
-  bool autostartEnabled = preferences.getBool("autostart_on", false);
+  // Bootscript gate — load the script text if EITHER trigger is armed:
+  //   * "Autorun at boot"        (autostart_on)  — fires on ESP boot
+  //   * "Autostart on USB attach"(autoattach_on) — fires on USB-C mount
+  // The script FILE is the same for both; only the trigger differs.
+  // bootModeEnabled gates the boot-fires-once branch below. The USB-
+  // attach branch reads bootScript directly, so we must load it too
+  // when only autoattach is armed.
+  bool autostartEnabled = preferences.getBool("autostart_on",  false);
+  bool autoattachEnabled= preferences.getBool("autoattach_on", false);
+  bool anyTriggerArmed  = autostartEnabled || autoattachEnabled;
   String bootPref = preferences.getString("boot_script", "");
   currentBootScriptFiles.clear();
   bootScript = "";
 
-  if (!autostartEnabled) {
+  if (!anyTriggerArmed) {
     if (bootPref.length() > 0 || SD.exists(String(DIR_SCRIPTS) + "/boot.txt")) {
-      Serial.println("[BOOT] Autostart disabled — boot script not loaded");
+      Serial.println("[BOOT] Autorun + Autostart both disabled - boot script not loaded");
     }
   } else if (bootPref.length() > 0) {
     int start = 0;
@@ -726,12 +737,15 @@ void setup() {
     }
 
     if (currentBootScriptFiles.size() > 0) {
-      bootModeEnabled = true;
+      // bootModeEnabled arms the "fires on first WiFi client connect"
+      // path in loop(). Only enable it when Autorun is on — Autostart
+      // (USB-attach) uses a different guard and mustn't double-fire.
+      bootModeEnabled = autostartEnabled;
       Serial.println("Boot scripts loaded: " + bootPref);
     }
   } else if (SD.exists(String(DIR_SCRIPTS) + "/boot.txt")) {
     bootScript = loadScript("boot.txt");
-    bootModeEnabled = true;
+    bootModeEnabled = autostartEnabled;
     currentBootScriptFiles.push_back("boot.txt");
     Serial.println("Default boot.txt found");
   }
@@ -880,6 +894,14 @@ void setup() {
         /*logging*/ loggingEnabled,
         /*com*/     comOn);
     watchUiSetAutostartToggle(autostart);
+    watchUiSetAutoattachToggle(preferences.getBool("autoattach_on", false));
+    // Personalization page state — brightness, screen-sleep, PIN, duress.
+    watchUiRefreshExtras(
+        preferences.getBool  ("screen_sleep_on", false),
+        preferences.getInt   ("brightness",     100),
+        preferences.getString("pin_value",       "").c_str(),
+        preferences.getString("duress_value",    "").c_str());
+    watchUiApplyBrightness(preferences.getInt("brightness", 100));
   }
   // Refresh the Files tab now the autostart target is known — light up the
   // star on the matching row if a boot_script is set.
@@ -959,6 +981,19 @@ void setup() {
   Serial.println(ap_password);
   Serial.println("Open browser and go to: 192.168.4.1");
 
+  // User report: silent USB "didn't work on first boot, but worked after
+  // retoggling". Root cause: Serial.begin() at line 371 re-enables the
+  // USB-Serial/JTAG PHY that STEP 0's usbBeginSilent() had disabled, so
+  // the host still saw the JTAG device throughout the whole boot. Once
+  // boot logging is done and no more Serial.println is expected, re-kill
+  // the JTAG PHY. USB.begin() (if any) already ran above and uses the
+  // FSLS PHY pads, not the JTAG PHY, so this doesn't affect HID/MSC.
+  if (silentStartup && !usbStarted) {
+    // Only when we haven't brought up TinyUSB — that means the wearer is
+    // in true stealth (no HID, no MSC, no CDC). Kill the JTAG PHY so
+    // the host sees literally nothing.
+    usb_serial_jtag_ll_phy_enable_pad(false);
+  }
   loadCommandHistory();
   // v4.4: the duplicate "check for reboot payload" block that used to live
   // here was dead code — the block near the top of setup() already deletes
@@ -1034,9 +1069,10 @@ void loop() {
     }
   }
 
-  // Inactivity screen-off: after 60 s of no touch, blank the AMOLED. Any
-  // touch resets LVGL's inactive-time counter, so the next tap wakes it.
-  {
+  // Inactivity screen-off — GATED behind the "Auto screen sleep" toggle
+  // in Settings. Default OFF per user request; the wearer opts in via
+  // the Personalization page.
+  if (preferences.getBool("screen_sleep_on", false)) {
     static unsigned long lastCheck = 0;
     if (millis() - lastCheck >= 500) {
       lastCheck = millis();
@@ -1045,11 +1081,12 @@ void loop() {
       if (!watchUiScreenAsleep() && idle >= SLEEP_MS) {
         watchUiScreenSleep();
       } else if (watchUiScreenAsleep() && idle < SLEEP_MS) {
-        // LVGL resets inactive_time on any indev activity — this branch
-        // fires on the wake tap.
         watchUiScreenWake();
       }
     }
+  } else if (watchUiScreenAsleep()) {
+    // Turned off mid-sleep — wake it up so the user isn't stuck black.
+    watchUiScreenWake();
   }
   if (watchUiConsumeStopPressed()) {
     if (scriptRunning) {
@@ -1135,7 +1172,7 @@ void loop() {
         } else {
           hidAttach();        // present replug on the existing stack
         }
-        watchUiFlash("Silent USB: off — HID re-attaching");
+        watchUiFlash("Silent USB: off - HID re-attaching");
       }
     }
     if (p.has_bt) {
@@ -1170,7 +1207,78 @@ void loop() {
       watchUiFlash(p.com_on ? "COM shell: next reboot"
                             : "COM shell off: next reboot");
     }
+    if (p.has_screen_sleep) {
+      preferences.putBool("screen_sleep_on", p.screen_sleep_on);
+      watchUiFlash(p.screen_sleep_on ? "Auto sleep ON" : "Auto sleep OFF");
+    }
+    if (p.has_brightness) {
+      preferences.putInt("brightness", p.brightness_pct);
+      // Apply live via MIPI DCS 0x51 (CO5300 supports it), 0..255 scaled
+      // from percent. 10% ~= 25/255 = lowest legible on this AMOLED.
+      watchUiApplyBrightness(p.brightness_pct);
+    }
+    if (p.has_pin) {
+      preferences.putString("pin_value", String(p.pin_value));
+      watchUiRefreshExtras(
+        preferences.getBool  ("screen_sleep_on", false),
+        preferences.getInt   ("brightness",     100),
+        preferences.getString("pin_value",       "").c_str(),
+        preferences.getString("duress_value",    "").c_str());
+    }
+    if (p.has_duress) {
+      preferences.putString("duress_value", String(p.duress_value));
+      watchUiRefreshExtras(
+        preferences.getBool  ("screen_sleep_on", false),
+        preferences.getInt   ("brightness",     100),
+        preferences.getString("pin_value",       "").c_str(),
+        preferences.getString("duress_value",    "").c_str());
+    }
+    if (p.has_selected) {
+      // Selected script — just persist for later; the Home Play button
+      // will consume it via s_pending.want_play (below).
+      selectedScriptName = String(p.selected_name);
+    }
+    if (p.want_play) {
+      // Same effect as tapping ▶ in Files but on the currently-selected
+      // script. If none is selected, just toast.
+      if (selectedScriptName.length() == 0) {
+        watchUiFlash("No script selected - tap one in Files");
+      } else if (scriptRunning) {
+        watchUiFlash("A script is already running");
+      } else if (!sdCardPresent) {
+        watchUiFlash("No SD card");
+      } else {
+        String script = loadScript(selectedScriptName);
+        if (script.length() == 0) {
+          watchUiFlash("Script empty or missing");
+        } else {
+          watchUiFlash((String("Running ") + selectedScriptName).c_str());
+          pendingScript = script;
+          pendingScriptReady = true;
+        }
+      }
+    }
     if (p.want_reboot) {
+      // Bug-hunt (blocker #1 for autorun): LVGL fires the toggle-Autorun
+      // callback AND the Reboot-button callback in the same lv_task_handler
+      // pass, so BOTH s_pendingExtras.has_autostart AND s_pending.want_reboot
+      // are set when we get here. The s_pendingExtras block (below) is
+      // consumed AFTER s_pending, so without this pre-flush the reboot path
+      // calls preferences.end() + restart BEFORE `autostart_on` ever hits
+      // NVS, and the wearer's just-flipped Autorun switch is silently lost
+      // on the reboot they triggered right after it. Drain the extras that
+      // affect boot NVS here first so they always land.
+      {
+        WatchUiPendingExtras drain = watchUiConsumePendingExtras();
+        if (drain.has_autostart) {
+          preferences.putBool("autostart_on", drain.autostart_on);
+          if (drain.autostart_on) preferences.putBool("autoattach_on", false);
+        }
+        if (drain.has_autoattach) {
+          preferences.putBool("autoattach_on", drain.autoattach_on);
+          if (drain.autoattach_on) preferences.putBool("autostart_on", false);
+        }
+      }
       watchUiFlash("Rebooting...");
       for (int i = 0; i < 20; ++i) { watchUiTick(); delay(20); }
       // Bug-hunt finding #8: flush NVS before restarting so a putBool from
@@ -1238,8 +1346,18 @@ void loop() {
     WatchUiPendingExtras pe = watchUiConsumePendingExtras();
     if (pe.has_autostart) {
       preferences.putBool("autostart_on", pe.autostart_on);
-      watchUiFlash(pe.autostart_on ? "Autostart armed (next boot)"
-                                   : "Autostart disarmed (next boot)");
+      // Mutual exclusion enforced on the ESP side too — flipping one on
+      // forces the other off in NVS so the two triggers can never both
+      // fire on the same script.
+      if (pe.autostart_on) preferences.putBool("autoattach_on", false);
+      watchUiFlash(pe.autostart_on ? "Autorun ON (fires on next boot)"
+                                   : "Autorun OFF");
+    }
+    if (pe.has_autoattach) {
+      preferences.putBool("autoattach_on", pe.autoattach_on);
+      if (pe.autoattach_on) preferences.putBool("autostart_on", false);
+      watchUiFlash(pe.autoattach_on ? "Autostart ON (fires on USB attach)"
+                                    : "Autostart OFF");
     }
     if (pe.want_reset_std) {
       // Match the prefs_off_v2 migration set exactly — silent_boot + am_hid
@@ -1254,16 +1372,31 @@ void loop() {
       preferences.putBool("com_on",          false);
       preferences.putBool("autostart_on",    false);
       preferences.remove("boot_script");
-      watchUiFlash("Reset to standard — rebooting");
+      watchUiFlash("Reset to standard - rebooting");
       for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
       preferences.end();                          // #8: flush the 10 puts above
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (pe.want_brick) {
       preferences.putBool("bricked", true);
-      watchUiFlash("Bricking — reflash to recover");
+      watchUiFlash("Bricking - reflash to recover");
       for (int i = 0; i < 40; ++i) { watchUiTick(); delay(20); }
       preferences.end();                          // #8: persist bricked=true
+      usb_persist_restart(RESTART_NO_PERSIST);
+    }
+    if (pe.want_duress) {
+      // Duress fired from the clock's PIN pad. Wipe every user script
+      // from SD (keep the web UI's HTML/CSS/JS intact), clear autostart,
+      // then brick the firmware. Reflash required to recover.
+      if (sdCardPresent) {
+        loadAvailableScripts();
+        for (const String& n : availableScripts) {
+          deleteScript(n);
+        }
+      }
+      preferences.remove("boot_script");
+      preferences.putBool("bricked", true);
+      preferences.end();
       usb_persist_restart(RESTART_NO_PERSIST);
     }
     if (pe.has_deadnet) {
@@ -1394,16 +1527,64 @@ void loop() {
     g_apStations = (int)WiFi.softAPgetStationNum();
   }
 
-  // Run the boot script ONCE per connection session, not on every loop.
-  // Guard first on bootModeEnabled so we skip the whole compare when not armed.
+  // "Autorun at boot" — fires the bootscript ONCE per boot as soon as
+  // USB HID is ready. User semantic per most-recent spec: "at boot"
+  // means "when the ESP starts up", not "when a WiFi client connects".
+  // With silent USB on, ensureHidReady() brings the PHY up first;
+  // then waits (bounded) for tud_mounted so keystrokes reach the host.
   if (bootModeEnabled) {
     static bool bootScriptHasRun = false;
-    if (g_apStations == 0) bootScriptHasRun = false;   // rearm when everyone leaves
-    if (g_apStations > 0 && !scriptRunning && !bootScriptHasRun) {
+    if (!bootScriptHasRun && !scriptRunning && bootScript.length() > 0) {
       bootScriptHasRun = true;
-      Serial.println("Client connected - executing boot script");
-      logCommand("BOOT_SCRIPT", "Executing boot script on client connection");
+      Serial.println("[BOOT] Autorun armed - executing boot script");
+      logCommand("BOOT_SCRIPT", "Autorun: firing at boot");
+      ensureHidReady();
+      unsigned long t0 = millis();
+      while (!tud_mounted() && (millis() - t0) < 1500) delay(10);
       executeScript(bootScript);
+    }
+  }
+
+  // "Autostart on USB attach" — poll VBUS at ~4 Hz for hot-plug edges.
+  //
+  // Bug-hunt blocker #1: initial value of s_wasVbus is FALSE, not true.
+  // A wearer's typical test flow is: enable autoattach on the AMOLED, then
+  // reboot with USB still plugged in. Static-local initialisers fire ONCE
+  // per program execution, so an initial value of `true` meant the FIRST
+  // poll after that reboot saw (nowVbus=true, s_wasVbus=true) and neither
+  // branch fired — the wearer never saw autoattach trigger unless they
+  // physically unplugged and re-plugged. `false` treats the first VBUS-
+  // present observation as an attach edge, so booting plugged-in AND
+  // hot-plugging both fire the payload as the wearer expects.
+  {
+    static unsigned long s_lastVbusPoll = 0;
+    static bool s_wasVbus     = false;   // first-observation counts as attach
+    static bool s_attachFired = false;
+    if (millis() - s_lastVbusPoll >= 250) {
+      s_lastVbusPoll = millis();
+      bool attachAutostartOn = preferences.getBool("autoattach_on", false);
+      bool nowVbus = watchUiVbusPresent();
+      if (!nowVbus) {
+        if (s_wasVbus) Serial.println("[VBUS] detach");
+        s_wasVbus     = false;
+        s_attachFired = false;
+      } else if (!s_wasVbus) {
+        s_wasVbus = true;
+        Serial.printf("[VBUS] attach detected (autoattach_on=%d, bootScript.len=%d, scriptRunning=%d)\n",
+                      (int)attachAutostartOn, (int)bootScript.length(), (int)scriptRunning);
+        if (attachAutostartOn && !s_attachFired && !scriptRunning &&
+            bootScript.length() > 0) {
+          s_attachFired = true;
+          ensureHidReady();
+          // Pump LVGL while waiting for host enumeration so the AMOLED
+          // doesn't freeze the whole driver-bind window.
+          unsigned long t0 = millis();
+          while (!tud_mounted() && (millis() - t0) < 1500) { watchUiTick(); delay(10); }
+          Serial.println("[VBUS] running bootscript on attach");
+          logCommand("BOOT_SCRIPT", "USB attach - running bootscript");
+          executeScript(bootScript);
+        }
+      }
     }
   }
 

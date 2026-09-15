@@ -8,7 +8,7 @@
 
 class ScreenClass {
 public:
-    ScreenClass() : bus(nullptr), gfx(nullptr), disp(nullptr) {}
+    ScreenClass() : bus(nullptr), gfx(nullptr), disp(nullptr), _brightOverlay(nullptr) {}
 
     void on() {
         if (!gfx) initDisplay();
@@ -22,6 +22,43 @@ public:
             gfx->fillScreen(RGB565_BLACK);
             Serial.println("Display powered off");
         }
+    }
+
+    // Brightness via SOFTWARE OVERLAY — QWavey's AMOLEDBrightness
+    // recipe (github.com/QWavey/ESP32-S3-Waveshare-OLED-Watch, path
+    // ESP_DISPLAY_TOUCH/BRIGHTNESS). The CO5300 panel on this watch
+    // ignores MIPI DCS 0x51, so we lay a black lv_obj on lv_layer_top
+    // and vary its opacity: brightness 100% = fully transparent, 10% =
+    // ~90% opacity black covering the pixels. Non-clickable so touches
+    // pass through to widgets underneath.
+    //
+    // pct is 0..100 percent. 0 = full black overlay (screen "off"),
+    // 100 = no overlay (native brightness).
+    void setBrightness(uint8_t pct) {
+        if (pct > 100) pct = 100;
+        lv_obj_t* top = lv_layer_top();
+        if (!top) return;
+        // Lazy-create the overlay on first call.
+        if (!_brightOverlay) {
+            _brightOverlay = lv_obj_create(top);
+            lv_obj_remove_style_all(_brightOverlay);
+            lv_obj_set_size(_brightOverlay, LCD_WIDTH, LCD_HEIGHT);
+            lv_obj_set_pos(_brightOverlay, 0, 0);
+            lv_obj_set_style_bg_color(_brightOverlay, lv_color_black(), 0);
+            lv_obj_set_style_border_width(_brightOverlay, 0, 0);
+            lv_obj_clear_flag(_brightOverlay, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(_brightOverlay, LV_OBJ_FLAG_SCROLLABLE);
+            // Not focusable, not scrollable, no ripple.
+            lv_obj_clear_flag(_brightOverlay, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        }
+        // Opacity: (100 - pct) * 255 / 100. pct=100 → opa=0 (off);
+        // pct=10 → opa=229 (~90% black).
+        uint8_t opa = (uint8_t)((100 - (int)pct) * 255 / 100);
+        lv_obj_set_style_bg_opa(_brightOverlay, opa, 0);
+        // Keep the overlay above every UI child that might get created
+        // later (toasts, modals) — LVGL puts new lv_layer_top() children
+        // above existing ones by default, so re-foreground us each set.
+        lv_obj_move_foreground(_brightOverlay);
     }
 
     lv_obj_t* button_create(lv_obj_t* parent, const char* text, lv_event_cb_t cb, int w, int h, int x=0, int y=0) {
@@ -67,6 +104,7 @@ private:
     // PSRAM). Falls back to internal on alloc failure.
     lv_color_t* buf;
     size_t      buf_bytes;
+    lv_obj_t*   _brightOverlay;   // black dimming overlay on lv_layer_top
 
     static void flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* pixel_map) {
         Arduino_GFX* gfx = (Arduino_GFX*)lv_display_get_user_data(disp);

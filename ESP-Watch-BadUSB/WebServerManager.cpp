@@ -664,7 +664,7 @@ $('#go').addEventListener('click', async () => {
 
     Serial.printf("[/api/save-wifi] OK: ssid='%s' pw-len=%u — rebooting\n",
                   newSsid.c_str(), (unsigned)newPsk.length());
-    watchUiFlash("WiFi saved — rebooting");
+    watchUiFlash("WiFi saved - rebooting");
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }
     watchSafeRestart();
@@ -1262,7 +1262,7 @@ $('#go').addEventListener('click', async () => {
 
     Serial.printf("[/api/setup-complete] OK: ssid='%s' pw-len=%u silent=%d — rebooting\n",
                   ssid.c_str(), (unsigned)pw.length(), (int)silent);
-    watchUiFlash("Setup saved — rebooting");
+    watchUiFlash("Setup saved - rebooting");
     server.send(200, "application/json", "{\"ok\":true,\"rebooting\":true}");
     // Let LWIP flush the 200 before we reset, and let the toast paint.
     for (int i = 0; i < 30; ++i) { watchUiTick(); delay(20); }

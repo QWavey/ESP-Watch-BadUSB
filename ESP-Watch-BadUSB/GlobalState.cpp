@@ -55,6 +55,7 @@ String g_currentTopScript = "";
 String lastCommand = "";
 bool scriptRunning = false;
 bool stopRequested = false;
+volatile bool scriptPaused = false;   // set/cleared by Home Play button
 bool bootModeEnabled = false;
 String bootScript = "";
 std::vector<String> currentBootScriptFiles;

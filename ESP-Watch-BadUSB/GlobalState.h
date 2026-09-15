@@ -58,6 +58,7 @@ extern std::map<String, String> variables;
 extern String lastCommand;
 extern bool scriptRunning;
 extern bool stopRequested;
+extern volatile bool scriptPaused;
 extern bool bootModeEnabled;
 extern String bootScript;
 extern std::vector<String> currentBootScriptFiles;

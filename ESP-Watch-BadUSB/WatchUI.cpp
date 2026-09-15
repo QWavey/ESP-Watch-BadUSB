@@ -12,6 +12,9 @@
 #include <Preferences.h>              // task #2: read clock_epoch/tz/sync_ms
                                        // to render real time on show()
 extern Preferences preferences;
+// scriptPaused lives in GlobalState — the Home Play button flips it to
+// pause/resume a running Ducky script mid-execution.
+extern volatile bool scriptPaused;
 
 // Global instances the extern declarations in those headers point at.
 ScreenClass  Screen;
@@ -33,15 +36,31 @@ static lv_obj_t* s_clientsLbl = nullptr;
 static lv_obj_t* s_battLbl    = nullptr;
 static lv_obj_t* s_flashLbl   = nullptr;
 static lv_obj_t* s_bannerLbl  = nullptr;
-static lv_obj_t* s_stopBtn    = nullptr;
+static lv_obj_t* s_runBanner  = nullptr;   // persistent "RUNNING <name>" strip
+static lv_obj_t* s_runBannerLbl = nullptr;
+static lv_obj_t* s_stopBtn    = nullptr;   // small red STOP on Home right
+static lv_obj_t* s_playBtn    = nullptr;   // small green PLAY on Home left
+static lv_obj_t* s_playLbl    = nullptr;   // icon label inside play btn
+static lv_obj_t* s_selectedLbl = nullptr;  // "Selected: xyz.txt" on Home
+static char      s_selectedName[64] = {0}; // basename of tapped script
+static int       s_scriptState = 0;        // 0=idle, 1=running, 2=paused
 static lv_obj_t* s_filesList  = nullptr;   // scroll container inside the Files tab
 static lv_obj_t* s_filesEmpty = nullptr;   // "no scripts yet" placeholder
 static lv_obj_t* s_lanStatusLbl = nullptr; // Settings-tab LAN badge under DeadNet
+static lv_obj_t* s_brightVal  = nullptr;   // brightness "%" label between +/-
+static int       s_brightnessPct = 100;    // current brightness
+static bool      s_screenSleepOn = false;  // user setting: auto-sleep enabled?
+static char      s_pinValue[8]   = {0};    // 4-digit PIN or ""
+static char      s_duressValue[8]= {0};    // 4-digit duress or ""
 
 // ---- Settings-tab switch handles (indexed by SETTING_*) -------------------
 enum SettingIdx {
     SET_WIFI = 0, SET_BT, SET_BTDISC, SET_LED,
-    SET_SILENT, SET_LOGGING, SET_COM, SET_AUTOSTART, SET_DEADNET,
+    SET_SILENT, SET_LOGGING, SET_COM,
+    SET_AUTOSTART,   // "Autorun at boot" — script fires on ESP boot
+    SET_DEADNET,
+    SET_SCREEN_SLEEP,
+    SET_AUTOATTACH,  // "Autostart on USB attach" — script fires on USB-C hot-plug
     SET_COUNT
 };
 static lv_obj_t* s_settingSw[SET_COUNT] = { nullptr };
@@ -66,9 +85,27 @@ static uint32_t s_bannerUntil = 0;
 static lv_obj_t* s_clockRoot   = nullptr;
 static lv_obj_t* s_clockTime   = nullptr;   // large HH:MM
 static lv_obj_t* s_clockHint   = nullptr;   // "swipe down to reveal"
-static lv_obj_t* s_tabView     = nullptr;   // captured for swipe-up handler
+// lv_tabview replaced with 3 manual containers (see watchUiBegin). The
+// class-handler race that made Settings gestures unreachable is gone
+// because there's no tabview class handler to compete with our own event
+// callbacks. s_activeTab is the source of truth for which of the 3
+// containers is currently visible.
+static int       s_activeTab   = 0;         // 0=Home, 1=Files, 2=Settings
+static lv_obj_t* s_tabView     = nullptr;   // legacy — kept as non-null flag
+// Manual tab-strip children — file-scope so the click handler AND the
+// gesture handler can both call manualStripRepaint() to re-tint the
+// active label and re-show the active-tab underline.
+static lv_obj_t* s_manualLbls  [3] = { nullptr };
+static lv_obj_t* s_manualUnder [3] = { nullptr };
 static bool      s_powerHold   = false;
 static bool      s_screenAsleep = false;
+// Set true once watchUiEnterBrickBlackscreen() runs. Every UI entry point
+// that could re-materialize widgets on the black failsafe (showTab,
+// watchUiShowClock, watchUiSetFileList, PIN pad, etc.) must skip when this
+// flag is set — otherwise a stray swipe-down on the brick screen redraws
+// the clock overlay via the screen-level GESTURE handler, defeating the
+// "black until reflash" intent. Bug-hunt R1.
+static bool      s_bricked      = false;
 extern class ScreenClass Screen;            // forward-declared instance in header
 
 // ---- design tokens ---------------------------------------------------------
@@ -97,14 +134,167 @@ static const int SAFE_BOT = 20;
 // Manual tab-strip height. File-scope so makeSettingsPage() can subtract it
 // from the settings-page height instead of a stale hard-coded `56` that
 // dated to the old built-in tab-bar (now tab_bar_size = 0). Bug-hunt R2.
-static const int STRIP_H  = 44;
+// Tab strip: bumped again to 72×14 top footprint for comfy fat-finger
+// tap zones on the AMOLED. Curve of the top bezel is roughly 60 px, so
+// STRIP_PAD_TOP=14 pushes labels safely below it.
+static const int STRIP_H       = 72;
+static const int STRIP_PAD_TOP = 14;
 static const int DOT_STRIP_H = 30;
 
 static lv_color_t lvhex(uint32_t rgb) { return lv_color_hex(rgb & 0xFFFFFF); }
 
+// Kill every LVGL animation on a single object across the states/parts
+// the default theme touches. Called by killAllAnimsRec below on the whole
+// screen tree — user asked "REMOVE ANY KIND OF ANIMATIONS", including
+// button-press fades, switch-slide, tabview-scroll, focus glow, etc.
+// anim_duration = 0 handles widgets that self-animate (switch, slider);
+// transition = nullptr handles the theme's LV_STATE_PRESSED fade.
+static void killAnimsOn(lv_obj_t* obj) {
+    static const lv_style_selector_t combos[] = {
+        LV_PART_MAIN      | LV_STATE_DEFAULT,
+        LV_PART_MAIN      | LV_STATE_PRESSED,
+        LV_PART_MAIN      | LV_STATE_CHECKED,
+        LV_PART_MAIN      | LV_STATE_FOCUSED,
+        LV_PART_MAIN      | LV_STATE_FOCUS_KEY,
+        LV_PART_MAIN      | LV_STATE_EDITED,
+        LV_PART_MAIN      | LV_STATE_HOVERED,
+        LV_PART_MAIN      | LV_STATE_SCROLLED,
+        LV_PART_MAIN      | LV_STATE_DISABLED,
+        LV_PART_INDICATOR | LV_STATE_DEFAULT,
+        LV_PART_INDICATOR | LV_STATE_CHECKED,
+        LV_PART_INDICATOR | LV_STATE_PRESSED,
+        LV_PART_KNOB      | LV_STATE_DEFAULT,
+        LV_PART_KNOB      | LV_STATE_CHECKED,
+        LV_PART_KNOB      | LV_STATE_PRESSED,
+        LV_PART_ITEMS     | LV_STATE_DEFAULT,
+        LV_PART_ITEMS     | LV_STATE_CHECKED,
+        LV_PART_ITEMS     | LV_STATE_PRESSED,
+    };
+    for (size_t i = 0; i < sizeof(combos)/sizeof(combos[0]); i++) {
+        lv_obj_set_style_anim_duration(obj, 0, combos[i]);
+        lv_obj_set_style_transition(obj, nullptr, combos[i]);
+    }
+}
+
+// Recursively kill animations on every child under `obj`. Call once after
+// the full UI tree is built so no theme-injected transitions or self-
+// animating widget parts remain.
+static void killAllAnimsRec(lv_obj_t* obj) {
+    if (!obj) return;
+    killAnimsOn(obj);
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        killAllAnimsRec(lv_obj_get_child(obj, i));
+    }
+}
+
+// Zero-time transition descriptor used to squash the default theme's
+// LV_STATE_PRESSED fade (~80 ms color-morph on button press). Never pass
+// nullptr to lv_obj_set_style_transition — that crashes the LVGL 9
+// transition subsystem on the next state change (verified). A VALID
+// dsc with time=0 and no properties skips animation without touching
+// any freeable pointer.
+static lv_style_transition_dsc_t s_zeroTx;
+static bool                      s_zeroTxInited = false;
+// Props that the LVGL 9 default theme animates between DEFAULT and
+// CHECKED/PRESSED — bg color+opa, border color, opacity as a whole. An
+// empty props array (INV only) left the theme's own transition intact
+// (LVGL falls back to theme dsc if our override has no props to
+// interpolate). Listing the props explicitly with time=0 means state
+// changes on those props run a zero-duration anim — instant swap.
+static const lv_style_prop_t     s_zeroTxProps[] = {
+    LV_STYLE_BG_COLOR,
+    LV_STYLE_BG_OPA,
+    LV_STYLE_BORDER_COLOR,
+    LV_STYLE_BORDER_WIDTH,
+    LV_STYLE_OPA,
+    LV_STYLE_TRANSFORM_SCALE_X,
+    LV_STYLE_TRANSFORM_SCALE_Y,
+    LV_STYLE_TRANSLATE_X,
+    LV_STYLE_TRANSLATE_Y,
+    LV_STYLE_PROP_INV,
+};
+
+static void ensureZeroTx() {
+    if (s_zeroTxInited) return;
+    lv_style_transition_dsc_init(&s_zeroTx, s_zeroTxProps,
+                                 lv_anim_path_linear, 0, 0, nullptr);
+    s_zeroTxInited = true;
+}
+
+// Kill press-fade + hover-fade + checked-fade transitions on ONE widget
+// across the standard part/state combos the LVGL 9 default theme touches.
+// Selectors that don't apply to a given widget are silently ignored.
+static void killWidgetAnims(lv_obj_t* obj) {
+    if (!obj) return;
+    ensureZeroTx();
+    static const lv_style_selector_t combos[] = {
+        LV_PART_MAIN      | LV_STATE_DEFAULT,
+        LV_PART_MAIN      | LV_STATE_PRESSED,
+        LV_PART_MAIN      | LV_STATE_CHECKED,
+        LV_PART_MAIN      | LV_STATE_FOCUSED,
+        LV_PART_INDICATOR | LV_STATE_DEFAULT,
+        LV_PART_INDICATOR | LV_STATE_CHECKED,
+        LV_PART_INDICATOR | LV_STATE_PRESSED,
+        LV_PART_KNOB      | LV_STATE_DEFAULT,
+        LV_PART_KNOB      | LV_STATE_CHECKED,
+        LV_PART_KNOB      | LV_STATE_PRESSED,
+    };
+    for (size_t i = 0; i < sizeof(combos)/sizeof(combos[0]); i++) {
+        lv_obj_set_style_transition   (obj, &s_zeroTx, combos[i]);
+        lv_obj_set_style_anim_duration(obj, 0,         combos[i]);
+    }
+}
+
+// Repaint the manual tab strip to reflect s_activeTab. Force a full
+// screen invalidate at the end — user reported the underline "stuck on
+// the wrong tab sometimes", which was individual underlines invalidating
+// but the strip's parent button not redrawing over the old underline's
+// pixel region on the frame we cared about. `lv_obj_invalidate` on the
+// screen is $$$-cheap-per-second (< 1 ms) and belt-and-braces guarantees
+// the underline pixels are always current with s_activeTab.
+static void manualStripRepaint() {
+    for (int i = 0; i < 3; i++) {
+        bool on = (i == s_activeTab);
+        if (s_manualLbls[i]) {
+            lv_obj_set_style_text_color(s_manualLbls[i],
+                lvhex(on ? C_TEXT : C_MUTED), 0);
+        }
+        if (s_manualUnder[i]) {
+            if (on) lv_obj_clear_flag(s_manualUnder[i], LV_OBJ_FLAG_HIDDEN);
+            else    lv_obj_add_flag  (s_manualUnder[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    lv_obj_invalidate(lv_scr_act());   // force full redraw
+}
+
+// Show one of the 3 manual tab containers, hide the other two, update
+// s_activeTab, sync the tab-strip, and reset Settings paging when
+// entering that tab. This is the ONLY way to change the active tab —
+// callers from click handlers, gesture handlers, and boot init all go
+// through here.
+static void settingsShowPage(int p);   // forward
+static void showTab(int idx) {
+    if (s_bricked) return;    // brick failsafe: no tab-swap after wipe
+    if (idx < 0 || idx > 2) return;
+    lv_obj_t* tabs[3] = { s_tabHome, s_tabFiles, s_tabSet };
+    for (int i = 0; i < 3; i++) {
+        if (!tabs[i]) continue;
+        if (i == idx) lv_obj_clear_flag(tabs[i], LV_OBJ_FLAG_HIDDEN);
+        else          lv_obj_add_flag  (tabs[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    s_activeTab = idx;
+    if (idx == 2) settingsShowPage(0);   // always land on page 0 in Settings
+    manualStripRepaint();
+}
+
 // ---- helpers ---------------------------------------------------------------
 static void stopBtnCb(lv_event_t* e) {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) s_stopEdge = true;
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    s_stopEdge = true;
+    // If we were paused, unpause so the interpreter loop can see the
+    // stopRequested flag the main .ino sets on its next tick.
+    scriptPaused = false;
 }
 
 // R1-B: XPowersPMU is a typedef for XPowersAXP2101 under XPOWERS_CHIP_AXP2101.
@@ -176,15 +366,12 @@ static lv_obj_t* makeSwitchRow(lv_obj_t* parent, const char* icon,
     lv_obj_t* sw = lv_switch_create(row);
     lv_obj_set_style_bg_color(sw, lvhex(C_LINE), 0);
     lv_obj_set_style_bg_color(sw, lvhex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    // Lag fix: LVGL animates the knob slide over 300 ms by default. On a
-    // 410×502 QSPI AMOLED the partial-redraw of that animation is what
-    // makes a tap feel like it takes half a second to register. Zero it.
-    lv_obj_set_style_anim_duration(sw, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_anim_duration(sw, 0, LV_PART_KNOB);
+    // Kill the ~300 ms knob slide + the theme's press/check FADE transition.
+    killWidgetAnims(sw);
     if (initial) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)idx);
-    // Lag fix: strip the row's press-highlight state so tapping anywhere
-    // else on the row doesn't queue a full-row redraw for the darken pass.
+    // Strip the row's press-highlight so tapping anywhere else on the row
+    // doesn't queue a full-row redraw for the darken pass.
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_STATE_PRESSED);
     if (idx >= 0 && idx < SET_COUNT) s_settingSw[idx] = sw;
     return row;
@@ -229,6 +416,7 @@ static lv_obj_t* makeActionRow(lv_obj_t* parent, const char* icon,
     lv_obj_set_style_bg_color(btn, lvhex(danger ? C_DANGER : C_ACCENT), 0);
     lv_obj_set_style_radius(btn, 8, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
+    killWidgetAnims(btn);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* bt = lv_label_create(btn);
     lv_label_set_text(bt, btnText);
@@ -254,7 +442,30 @@ static void settingSwitchCb(lv_event_t* e) {
         case SET_SILENT:    s_pending.has_silent  = true; s_pending.silent_on  = on; break;
         case SET_LOGGING:   s_pending.has_logging = true; s_pending.logging_on = on; break;
         case SET_COM:       s_pending.has_com     = true; s_pending.com_on     = on; break;
-        case SET_AUTOSTART: s_pendingExtras.has_autostart = true;
+        case SET_SCREEN_SLEEP:
+                            s_pending.has_screen_sleep = true;
+                            s_pending.screen_sleep_on  = on;
+                            s_screenSleepOn = on;
+                            break;
+        case SET_AUTOATTACH:
+                            // Mutually exclusive with autorun-at-boot.
+                            if (on && s_settingSw[SET_AUTOSTART] &&
+                                lv_obj_has_state(s_settingSw[SET_AUTOSTART], LV_STATE_CHECKED)) {
+                                lv_obj_clear_state(s_settingSw[SET_AUTOSTART], LV_STATE_CHECKED);
+                                s_pendingExtras.has_autostart = true;
+                                s_pendingExtras.autostart_on  = false;
+                            }
+                            s_pendingExtras.has_autoattach = true;
+                            s_pendingExtras.autoattach_on  = on;
+                            break;
+        case SET_AUTOSTART: // Fires on ESP BOOT; opposite of SET_AUTOATTACH.
+                            if (on && s_settingSw[SET_AUTOATTACH] &&
+                                lv_obj_has_state(s_settingSw[SET_AUTOATTACH], LV_STATE_CHECKED)) {
+                                lv_obj_clear_state(s_settingSw[SET_AUTOATTACH], LV_STATE_CHECKED);
+                                s_pendingExtras.has_autoattach = true;
+                                s_pendingExtras.autoattach_on  = false;
+                            }
+                            s_pendingExtras.has_autostart = true;
                             s_pendingExtras.autostart_on  = on; break;
         case SET_DEADNET:   s_pendingExtras.has_deadnet   = true;
                             s_pendingExtras.deadnet_on    = on; break;
@@ -285,6 +496,13 @@ static void buildHomeTab(lv_obj_t* tab) {
     lv_label_set_text(s_battLbl, LV_SYMBOL_BATTERY_FULL " -- %");
     lv_obj_set_style_text_color(s_battLbl, lvhex(C_MUTED), 0);
     lv_obj_set_style_text_font(s_battLbl, &lv_font_montserrat_16, 0);
+    // Fixed width + right-aligned text + no transform scale — user saw
+    // stretching on "80% 4.02V" style updates. Same fix as the clock: pin
+    // width and align inside, don't let LV_SIZE_CONTENT redo layout per
+    // string change.
+    lv_obj_set_width(s_battLbl, 160);
+    lv_obj_set_style_text_align(s_battLbl, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(s_battLbl, LV_LABEL_LONG_CLIP);
     lv_obj_align(s_battLbl, LV_ALIGN_TOP_RIGHT, 0, 8);
 
     // Script + progress
@@ -352,23 +570,80 @@ static void buildHomeTab(lv_obj_t* tab) {
     // tabs. Now created on lv_layer_top() in watchUiBegin() alongside the
     // banner so every tab sees the toast.
 
-    // STOP button — inside the rounded-corner safe area along the bottom.
-    // Bug-hunt R10: was LCD_W - 24 (12 px margin), whose bottom-right
-    // corner fell OUTSIDE the panel's ~60 px corner radius and got
-    // sliced. LCD_W - 2*SAFE_X (=330 px) stays inside the visible circle
-    // and matches the settings rows.
+    // "Selected:" label sits just above the Play/Stop row. Empty when
+    // nothing is queued — filled by watchUiSetSelectedScript() (called
+    // when the user taps a script row in Files).
+    s_selectedLbl = lv_label_create(tab);
+    lv_label_set_text(s_selectedLbl, "");
+    lv_obj_set_style_text_color(s_selectedLbl, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(s_selectedLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_width(s_selectedLbl, LCD_W - 2 * SAFE_X);
+    lv_label_set_long_mode(s_selectedLbl, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(s_selectedLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_selectedLbl, LV_ALIGN_BOTTOM_MID, 0, -100);
+
+    // Play (green, left) + Stop (red, right). Small compact pair — the
+    // full-width Stop was overkill and dominated the tab. Play arms/runs
+    // the SELECTED script (or the last-run one); Stop stops a running
+    // script. Both stay inside the AMOLED's rounded safe area.
+    const int rowW  = LCD_W - 2 * SAFE_X;
+    const int btnH  = 74;
+    const int btnW  = 100;
+    const int gap   = 12;
+    // Two-button pair centered inside the safe area.
+    const int pairW = 2 * btnW + gap;
+    const int pairX = SAFE_X + (rowW - pairW) / 2;
+    const int btnY  = -10;   // negative Y = align to bottom
+
+    s_playBtn = lv_btn_create(tab);
+    lv_obj_set_size(s_playBtn, btnW, btnH);
+    lv_obj_align(s_playBtn, LV_ALIGN_BOTTOM_LEFT, pairX, btnY);
+    lv_obj_set_style_bg_color(s_playBtn, lvhex(C_OK), 0);
+    lv_obj_set_style_bg_color(s_playBtn, lvhex(C_OK), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(s_playBtn, 12, 0);
+    lv_obj_set_style_shadow_width(s_playBtn, 0, 0);
+    killWidgetAnims(s_playBtn);
+    lv_obj_add_event_cb(s_playBtn, [](lv_event_t* e){
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        // Tri-state: idle → run, running → pause, paused → continue.
+        // Idle path queues to the main loop; pause/resume flip the
+        // scriptPaused global directly (main loop sees it every 50 ms).
+        if (s_scriptState == 0) {
+            s_pending.want_play = true;   // launches selectedScriptName
+        } else if (s_scriptState == 1) {
+            scriptPaused = true;
+            watchUiSetScriptState(2);
+            watchUiFlash("Paused");
+        } else if (s_scriptState == 2) {
+            scriptPaused = false;
+            watchUiSetScriptState(1);
+            watchUiFlash("Continuing");
+        }
+    }, LV_EVENT_CLICKED, nullptr);
+    s_playLbl = lv_label_create(s_playBtn);
+    lv_label_set_text(s_playLbl, LV_SYMBOL_PLAY);
+    lv_obj_set_style_text_color(s_playLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_playLbl, &lv_font_montserrat_32, 0);
+    lv_obj_center(s_playLbl);
+
     s_stopBtn = lv_btn_create(tab);
-    lv_obj_set_size(s_stopBtn, LCD_W - 2 * SAFE_X, 74);
-    lv_obj_align(s_stopBtn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_size(s_stopBtn, btnW, btnH);
+    lv_obj_align(s_stopBtn, LV_ALIGN_BOTTOM_LEFT, pairX + btnW + gap, btnY);
     lv_obj_set_style_bg_color(s_stopBtn, lvhex(C_DANGER), 0);
+    lv_obj_set_style_bg_color(s_stopBtn, lvhex(C_DANGER), LV_STATE_PRESSED);
     lv_obj_set_style_radius(s_stopBtn, 12, 0);
     lv_obj_set_style_shadow_width(s_stopBtn, 0, 0);
+    killWidgetAnims(s_stopBtn);
     lv_obj_add_event_cb(s_stopBtn, stopBtnCb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* stopLbl = lv_label_create(s_stopBtn);
-    lv_label_set_text(stopLbl, LV_SYMBOL_STOP "  STOP SCRIPT");
+    lv_label_set_text(stopLbl, LV_SYMBOL_STOP);
     lv_obj_set_style_text_color(stopLbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(stopLbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(stopLbl, &lv_font_montserrat_32, 0);
     lv_obj_center(stopLbl);
+
+    // Dim the Stop button by default (no script running). Actual state
+    // updates come via watchUiSetScriptState() from the main loop.
+    lv_obj_set_style_bg_opa(s_stopBtn, LV_OPA_40, 0);
 }
 
 // ---- Files tab -------------------------------------------------------------
@@ -381,6 +656,9 @@ static void filesRunCb(lv_event_t* e) {
     s_pendingAction.has_run = true;
     strncpy(s_pendingAction.run_name, name, sizeof(s_pendingAction.run_name) - 1);
     s_pendingAction.run_name[sizeof(s_pendingAction.run_name) - 1] = '\0';
+    // Also register as the selected script so the persistent RUNNING
+    // banner + Home Play button both know the name.
+    watchUiSetSelectedScript(name);
 }
 static void filesDelCb(lv_event_t* e) {
     const char* name = (const char*)lv_event_get_user_data(e);
@@ -417,7 +695,16 @@ static void buildFilesTab(lv_obj_t* tab) {
     // end animation that on this QSPI AMOLED reads as lag. Kill both.
     lv_obj_set_scroll_snap_x(s_filesList, LV_SCROLL_SNAP_NONE);
     lv_obj_set_scroll_snap_y(s_filesList, LV_SCROLL_SNAP_NONE);
-    lv_obj_set_style_anim_duration(s_filesList, 0, LV_STATE_SCROLLED);
+    // Bug-hunt R5: anim_duration=0 in LV_STATE_SCROLLED does NOT reliably
+    // kill LVGL's scroll-end throw — that anim reads the style with
+    // selector=LV_PART_MAIN and the state at animation start (still
+    // DEFAULT for the first frame after release). Use plain selector 0 so
+    // every state resolves to 0-duration. Also clear the SCROLL_ELASTIC
+    // and SCROLL_MOMENTUM flags — with them still set (LVGL default) each
+    // finger flick spawned a ~300 ms overscroll bounce that reads as lag.
+    lv_obj_set_style_anim_duration(s_filesList, 0, 0);
+    lv_obj_clear_flag(s_filesList, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_clear_flag(s_filesList, LV_OBJ_FLAG_SCROLL_MOMENTUM);
     // Curvy safe-area: leave a horizontal gutter so each row (also inset
     // now) sits inside the visible circle.
     lv_obj_set_style_pad_left(s_filesList, SAFE_X, 0);
@@ -454,7 +741,7 @@ static std::vector<std::string> s_fileRowNames;
 // switch (swipe UP = next page, swipe DOWN = previous). No scroll, no
 // anim; each page swap is a hide/show of a full-screen page container.
 // Three pages: Radios, Behaviour, Actions.
-#define SETTINGS_PAGE_COUNT 3
+#define SETTINGS_PAGE_COUNT 4
 static lv_obj_t* s_settingsPages[SETTINGS_PAGE_COUNT] = { nullptr };
 static lv_obj_t* s_settingsDots [SETTINGS_PAGE_COUNT] = { nullptr };
 static int       s_settingsPage = 0;
@@ -471,8 +758,18 @@ static void settingsShowPage(int p) {
     }
     for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) {
         if (!s_settingsDots[i]) continue;
-        lv_obj_set_style_bg_color(s_settingsDots[i],
-            lvhex(i == p ? C_ACCENT : C_LINE), 0);
+        // Set for EVERY state selector combo we know the theme might tint.
+        // User reported a lingering blue tint on dot 0 no matter which
+        // page was active — traced to LVGL applying a checked-state
+        // color from the theme when set_active was called on a flex-row
+        // first child during focus init. Belt-and-braces override every
+        // state at the same time and force redraw.
+        uint32_t col = (i == p) ? C_ACCENT : C_LINE;
+        lv_obj_set_style_bg_color(s_settingsDots[i], lvhex(col), 0);
+        lv_obj_set_style_bg_color(s_settingsDots[i], lvhex(col), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_color(s_settingsDots[i], lvhex(col), LV_STATE_CHECKED);
+        lv_obj_set_style_bg_color(s_settingsDots[i], lvhex(col), LV_STATE_FOCUSED);
+        lv_obj_invalidate(s_settingsDots[i]);
     }
 }
 
@@ -526,8 +823,7 @@ static lv_obj_t* makeBigSwitchRow(lv_obj_t* parent, const char* icon,
     lv_obj_set_size(sw, 72, 42);
     lv_obj_set_style_bg_color(sw, lvhex(C_LINE), 0);
     lv_obj_set_style_bg_color(sw, lvhex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_anim_duration(sw, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_anim_duration(sw, 0, LV_PART_KNOB);
+    killWidgetAnims(sw);
     if (initial) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)idx);
     if (idx >= 0 && idx < SET_COUNT) s_settingSw[idx] = sw;
@@ -573,6 +869,7 @@ static lv_obj_t* makeBigActionRow(lv_obj_t* parent, const char* icon,
     lv_obj_set_style_bg_color(btn, lvhex(danger ? C_DANGER : C_ACCENT), 0);
     lv_obj_set_style_radius(btn, 10, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
+    killWidgetAnims(btn);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* bt = lv_label_create(btn);
     lv_label_set_text(bt, btnText);
@@ -582,15 +879,311 @@ static lv_obj_t* makeBigActionRow(lv_obj_t* parent, const char* icon,
     return row;
 }
 
+// A row with a numeric value between minus/plus buttons — used for
+// brightness. Value stored in s_brightnessPct; +/- adjust in `step` and
+// queue via s_pending.has_brightness so the main loop applies to the
+// display driver + persists to NVS.
+static lv_obj_t* makeBrightnessRow(lv_obj_t* parent, const char* icon,
+                                   const char* label, int step) {
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 80);
+    lv_obj_set_scroll_dir(row, LV_DIR_NONE);
+    lv_obj_set_style_pad_hor(row, 16, 0);
+    lv_obj_set_style_pad_ver(row, 10, 0);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, lvhex(C_LINE), 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                               LV_FLEX_ALIGN_CENTER,
+                               LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_STATE_PRESSED);
+
+    lv_obj_t* ic = lv_label_create(row);
+    lv_label_set_text(ic, icon);
+    lv_obj_set_style_text_color(ic, lvhex(C_MUTED), 0);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_pad_right(ic, 14, 0);
+    lv_obj_set_width(ic, 36);
+
+    lv_obj_t* lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label);
+    lv_obj_set_style_text_color(lbl, lvhex(C_TEXT), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_flex_grow(lbl, 1);
+
+    auto makeStep = [&](const char* txt, int delta) {
+        lv_obj_t* b = lv_btn_create(row);
+        lv_obj_set_size(b, 52, 52);
+        lv_obj_set_style_bg_color(b, lvhex(C_ACCENT), 0);
+        lv_obj_set_style_bg_color(b, lvhex(C_ACCENT), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        killWidgetAnims(b);
+        lv_obj_set_style_margin_left(b, 6, 0);
+        lv_obj_add_event_cb(b, [](lv_event_t* e){
+            int d = (int)(intptr_t)lv_event_get_user_data(e);
+            int next = s_brightnessPct + d;
+            if (next < 10)  next = 10;
+            if (next > 100) next = 100;
+            s_brightnessPct = next;
+            if (s_brightVal) {
+                char buf[8]; snprintf(buf, sizeof(buf), "%d%%", next);
+                lv_label_set_text(s_brightVal, buf);
+            }
+            s_pending.has_brightness   = true;
+            s_pending.brightness_pct   = next;
+        }, LV_EVENT_CLICKED, (void*)(intptr_t)delta);
+        lv_obj_t* t = lv_label_create(b);
+        lv_label_set_text(t, txt);
+        lv_obj_set_style_text_color(t, lv_color_white(), 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+        lv_obj_center(t);
+        return b;
+    };
+    makeStep("-", -step);
+    s_brightVal = lv_label_create(row);
+    char buf[8]; snprintf(buf, sizeof(buf), "%d%%", s_brightnessPct);
+    lv_label_set_text(s_brightVal, buf);
+    lv_obj_set_style_text_color(s_brightVal, lvhex(C_TEXT), 0);
+    lv_obj_set_style_text_font(s_brightVal, &lv_font_montserrat_22, 0);
+    lv_obj_set_width(s_brightVal, 72);
+    lv_obj_set_style_text_align(s_brightVal, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_margin_left(s_brightVal, 6, 0);
+    makeStep("+",  step);
+    return row;
+}
+
+// Modal 4-digit PIN pad. Auto-submits when the 4th digit is entered
+// (no OK button). Optional "Remove PIN/Duress" long button below the
+// 0 clears the stored value. Overlay is parented to lv_scr_act so
+// gestures on it reach the screen-level swipe handler (see comment on
+// watchUiShowClock for the same reason).
+typedef void (*PinPadDoneCb)(bool ok, const char* pin, bool wantRemove);
+static lv_obj_t* s_pinPadRoot = nullptr;
+static lv_obj_t* s_pinDigits  = nullptr;
+static PinPadDoneCb s_pinDoneCb = nullptr;
+static char s_pinBuf[8] = {0};
+
+static void pinPadUpdate() {
+    if (!s_pinDigits) return;
+    char m[16] = {0};
+    int n = strlen(s_pinBuf);
+    // Spaces between digits give visible separation without the theme's
+    // proportional-font kerning making the whole label feel stretched.
+    // Same pattern as the clock label — fixed-width label + centered text.
+    for (int i = 0; i < 4; i++) {
+        m[i * 2]     = (i < n) ? '*' : '_';
+        m[i * 2 + 1] = ' ';
+    }
+    lv_label_set_text(s_pinDigits, m);
+}
+static void pinPadClose() {
+    if (!s_pinPadRoot) return;
+    lv_obj_t* doomed = s_pinPadRoot;
+    s_pinPadRoot = nullptr;
+    s_pinDigits = nullptr;
+    s_pinBuf[0] = '\0';
+    lv_obj_del_async(doomed);
+}
+// Extended sig: pass a `removeLabel` — if non-empty, a full-width long
+// button below the numeric grid says that ("Remove PIN" / "Remove
+// duress code"). Tap → callback with wantRemove=true.
+static void watchUiShowPinPad(const char* prompt,
+                              const char* removeLabel,
+                              PinPadDoneCb done) {
+    if (s_bricked) return;
+    if (s_pinPadRoot) return;
+    s_pinDoneCb = done;
+    s_pinBuf[0] = '\0';
+    s_pinPadRoot = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(s_pinPadRoot);
+    lv_obj_set_size(s_pinPadRoot, LCD_W, LCD_H);
+    lv_obj_set_pos(s_pinPadRoot, 0, 0);
+    lv_obj_set_style_bg_color(s_pinPadRoot, lvhex(C_BG), 0);
+    lv_obj_set_style_bg_opa(s_pinPadRoot, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_pinPadRoot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(s_pinPadRoot);
+
+    lv_obj_t* title = lv_label_create(s_pinPadRoot);
+    lv_label_set_text(title, prompt);
+    lv_obj_set_style_text_color(title, lvhex(C_TEXT), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_letter_space(title, 0, 0);
+    lv_obj_set_style_transform_scale_x(title, 256, 0);
+    lv_obj_set_style_transform_scale_y(title, 256, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+
+    // Digit display: FIXED width + CENTER-align + pinned transform_scale
+    // + monospaced letter-space. Same "italic/stretched" bug we hit on
+    // the clock label — LV_SIZE_CONTENT + theme transform on state
+    // changes gives the illusion the font is slanting.
+    s_pinDigits = lv_label_create(s_pinPadRoot);
+    lv_label_set_text(s_pinDigits, "_ _ _ _ ");
+    lv_obj_set_style_text_color(s_pinDigits, lvhex(C_ACCENT), 0);
+    lv_obj_set_style_text_font(s_pinDigits, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_letter_space(s_pinDigits, 0, 0);
+    lv_obj_set_style_transform_scale_x(s_pinDigits, 256, 0);
+    lv_obj_set_style_transform_scale_y(s_pinDigits, 256, 0);
+    lv_obj_set_width(s_pinDigits, LCD_W - 80);
+    lv_obj_set_style_text_align(s_pinDigits, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_pinDigits, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_pinDigits, LV_ALIGN_TOP_MID, 0, 66);
+
+    // 3×3 digit grid then a bottom row of [backspace] [0] [cancel]. The
+    // OK button is gone — the 4th digit press auto-submits, matching
+    // the "auto approve code, no yes checkmark" spec.
+    const char* keys[12] = {
+        "1","2","3",
+        "4","5","6",
+        "7","8","9",
+        "<","0","X",
+    };
+    const int kw = 82, kh = 56, gap = 8;
+    const int gridW = 3 * kw + 2 * gap;
+    const int gridX = (LCD_W - gridW) / 2;
+    const int gridY = 150;
+    for (int i = 0; i < 12; i++) {
+        int r = i / 3, c = i % 3;
+        lv_obj_t* b = lv_btn_create(s_pinPadRoot);
+        lv_obj_set_size(b, kw, kh);
+        lv_obj_set_pos(b, gridX + c * (kw + gap), gridY + r * (kh + gap));
+        bool isCancel = (strcmp(keys[i], "X") == 0);
+        bool isBksp   = (strcmp(keys[i], "<") == 0);
+        uint32_t bg = isCancel ? C_DANGER : (isBksp ? 0x2A2A30 : C_SURFACE);
+        lv_obj_set_style_bg_color(b, lvhex(bg), 0);
+        lv_obj_set_style_bg_color(b, lvhex(bg), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        killWidgetAnims(b);
+        lv_obj_add_event_cb(b, [](lv_event_t* e){
+            const char* k = (const char*)lv_event_get_user_data(e);
+            if (!k) return;
+            if (strcmp(k, "X") == 0) {
+                PinPadDoneCb cb = s_pinDoneCb;
+                s_pinDoneCb = nullptr;
+                pinPadClose();
+                if (cb) cb(false, "", false);
+                return;
+            }
+            if (strcmp(k, "<") == 0) {
+                int n = strlen(s_pinBuf);
+                if (n > 0) { s_pinBuf[n-1] = '\0'; pinPadUpdate(); }
+                return;
+            }
+            // digit — append + auto-submit at 4 digits.
+            int n = strlen(s_pinBuf);
+            if (n >= 4) return;
+            s_pinBuf[n]   = k[0];
+            s_pinBuf[n+1] = '\0';
+            pinPadUpdate();
+            if (strlen(s_pinBuf) == 4) {
+                char pin[8]; strncpy(pin, s_pinBuf, sizeof(pin));
+                PinPadDoneCb cb = s_pinDoneCb;
+                s_pinDoneCb = nullptr;
+                pinPadClose();
+                if (cb) cb(true, pin, false);
+            }
+        }, LV_EVENT_CLICKED, (void*)keys[i]);
+        lv_obj_t* tt = lv_label_create(b);
+        // Backspace / cancel show a symbol; digits show the digit.
+        const char* label = keys[i];
+        if (strcmp(keys[i], "<") == 0) label = LV_SYMBOL_BACKSPACE;
+        if (strcmp(keys[i], "X") == 0) label = LV_SYMBOL_CLOSE;
+        lv_label_set_text(tt, label);
+        lv_obj_set_style_text_color(tt, lv_color_white(), 0);
+        lv_obj_set_style_text_font(tt, &lv_font_montserrat_22, 0);
+        lv_obj_set_style_text_letter_space(tt, 0, 0);
+        lv_obj_center(tt);
+    }
+
+    // Optional long "Remove" button below the grid.
+    if (removeLabel && removeLabel[0]) {
+        const int longY = gridY + 4 * (kh + gap);
+        lv_obj_t* rb = lv_btn_create(s_pinPadRoot);
+        lv_obj_set_size(rb, gridW, kh);
+        lv_obj_set_pos(rb, gridX, longY);
+        lv_obj_set_style_bg_color(rb, lvhex(0x8A2A2A), 0);
+        lv_obj_set_style_bg_color(rb, lvhex(0x8A2A2A), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(rb, 8, 0);
+        lv_obj_set_style_shadow_width(rb, 0, 0);
+        killWidgetAnims(rb);
+        lv_obj_add_event_cb(rb, [](lv_event_t*){
+            PinPadDoneCb cb = s_pinDoneCb;
+            s_pinDoneCb = nullptr;
+            pinPadClose();
+            if (cb) cb(true, "", true);   // wantRemove=true
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* rl = lv_label_create(rb);
+        lv_label_set_text(rl, removeLabel);
+        lv_obj_set_style_text_color(rl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(rl, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(rl, 0, 0);
+        lv_obj_center(rl);
+    }
+}
+
+// Callbacks for "Set PIN" / "Set Duress" action buttons.
+static void setPinBtnCb(lv_event_t*) {
+    // Remove long-button only offered when a PIN is currently set.
+    const char* removeLabel = (s_pinValue[0]) ? "Remove PIN" : "";
+    watchUiShowPinPad("Enter new PIN", removeLabel, [](bool ok, const char* pin, bool wantRemove){
+        if (!ok) return;
+        if (wantRemove) {
+            // Also implicitly wipe the duress code — a lone duress with no
+            // PIN is a security footgun. Setter code accepts "" as clear.
+            s_pending.has_pin        = true;
+            s_pending.pin_value[0]   = '\0';
+            s_pending.has_duress     = true;
+            s_pending.duress_value[0] = '\0';
+            watchUiFlash(LV_SYMBOL_OK "  PIN removed");
+            return;
+        }
+        s_pending.has_pin = true;
+        strncpy(s_pending.pin_value, pin, sizeof(s_pending.pin_value) - 1);
+        s_pending.pin_value[sizeof(s_pending.pin_value) - 1] = '\0';
+        watchUiFlash(LV_SYMBOL_OK "  PIN saved");
+    });
+}
+static void setDuressBtnCb(lv_event_t*) {
+    // Duress requires a PIN — a duress code only exists to be entered
+    // INSTEAD of the real PIN, so with no PIN it makes no sense.
+    if (!s_pinValue[0]) {
+        watchUiFlash("Set a PIN first before a duress code");
+        return;
+    }
+    const char* removeLabel = (s_duressValue[0]) ? "Remove duress code" : "";
+    watchUiShowPinPad("Enter duress code", removeLabel, [](bool ok, const char* pin, bool wantRemove){
+        if (!ok) return;
+        if (wantRemove) {
+            s_pending.has_duress       = true;
+            s_pending.duress_value[0]  = '\0';
+            watchUiFlash(LV_SYMBOL_OK "  Duress code removed");
+            return;
+        }
+        // Duress must differ from PIN.
+        if (s_pinValue[0] && strcmp(s_pinValue, pin) == 0) {
+            watchUiFlash("Duress code can't equal PIN");
+            return;
+        }
+        s_pending.has_duress = true;
+        strncpy(s_pending.duress_value, pin, sizeof(s_pending.duress_value) - 1);
+        s_pending.duress_value[sizeof(s_pending.duress_value) - 1] = '\0';
+        watchUiFlash(LV_SYMBOL_OK "  Duress code saved");
+    });
+}
+
 static lv_obj_t* makeSettingsPage(lv_obj_t* tab) {
     lv_obj_t* page = lv_obj_create(tab);
     lv_obj_remove_style_all(page);
     // Bug-hunt R2: the manual tab strip lives outside the tabview (on scr),
     // so the tab content already has full tabview-content height. Only
-    // subtract the bottom dot indicator strip. Previously we subtracted a
-    // stale 56 that used to be the built-in tab bar size, leaving 12 px of
-    // dead space between the last row and the dot indicator.
-    lv_obj_set_size(page, LCD_W, LCD_H - STRIP_H - DOT_STRIP_H);
+    // subtract the bottom dot indicator strip AND the strip's top padding
+    // (which shifted the whole tabview down). Previously we subtracted a
+    // stale 56 that used to be the built-in tab bar size.
+    lv_obj_set_size(page, LCD_W, LCD_H - STRIP_H - STRIP_PAD_TOP - DOT_STRIP_H);
     lv_obj_set_pos(page, 0, 0);
     lv_obj_set_style_bg_color(page, lvhex(C_BG), 0);
     lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
@@ -630,14 +1223,24 @@ static void buildSettingsTab(lv_obj_t* tab) {
     s_settingsPages[1] = makeSettingsPage(tab);
     makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_LIST,      "Log to SD",       false, settingSwitchCb, SET_LOGGING);
     makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_USB,       "COM shell (CDC)", false, settingSwitchCb, SET_COM);
-    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_PLAY,      "Autostart at boot", false, settingSwitchCb, SET_AUTOSTART);
+    // Two mutually-exclusive bootscript triggers. Enabling one auto-
+    // disables the other (see settingSwitchCb).
+    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_REFRESH,  "Autorun at boot",       false, settingSwitchCb, SET_AUTOSTART);
+    makeBigSwitchRow(s_settingsPages[1], LV_SYMBOL_PLAY,     "Autostart on USB attach", false, settingSwitchCb, SET_AUTOATTACH);
 
-    // Page 3 — Actions (Reboot, Reset to standard, Factory reset, Brick)
+    // Page 3 — Personalization (Screen sleep, Brightness, Set PIN, Set Duress)
     s_settingsPages[2] = makeSettingsPage(tab);
-    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
-    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_LOOP,    "Reset to standard", "RESET",  false, resetStdBtnCb);
-    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_TRASH,   "Factory reset",     "WIPE",   true,  factoryResetBtnCb);
-    makeBigActionRow(s_settingsPages[2], LV_SYMBOL_WARNING, "Brick firmware",    "BRICK",  true,  brickBtnCb);
+    makeBigSwitchRow (s_settingsPages[2], LV_SYMBOL_POWER,   "Auto screen sleep", false, settingSwitchCb, SET_SCREEN_SLEEP);
+    makeBrightnessRow(s_settingsPages[2], LV_SYMBOL_IMAGE,   "Brightness", 10);
+    makeBigActionRow (s_settingsPages[2], LV_SYMBOL_KEYBOARD,"Set PIN",        "SET", false, setPinBtnCb);
+    makeBigActionRow (s_settingsPages[2], LV_SYMBOL_WARNING, "Set duress code","SET", true,  setDuressBtnCb);
+
+    // Page 4 — Actions (Reboot, Reset to standard, Factory reset, Brick)
+    s_settingsPages[3] = makeSettingsPage(tab);
+    makeBigActionRow(s_settingsPages[3], LV_SYMBOL_REFRESH, "Reboot",            "REBOOT", false, rebootBtnCb);
+    makeBigActionRow(s_settingsPages[3], LV_SYMBOL_LOOP,    "Reset to standard", "RESET",  false, resetStdBtnCb);
+    makeBigActionRow(s_settingsPages[3], LV_SYMBOL_TRASH,   "Factory reset",     "WIPE",   true,  factoryResetBtnCb);
+    makeBigActionRow(s_settingsPages[3], LV_SYMBOL_WARNING, "Brick firmware",    "BRICK",  true,  brickBtnCb);
 
     // Dot indicator strip at the bottom
     s_settingsPageIndicator = lv_obj_create(tab);
@@ -659,6 +1262,24 @@ static void buildSettingsTab(lv_obj_t* tab) {
         lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lvhex(C_LINE), 0);
+        // Dots aren't buttons — no click, no press, no focus states.
+        // Otherwise LVGL was tinting dot 0 blue via the default focused/
+        // pressed style that leaked in via LV_STATE_ANY on the first
+        // child of a flex container. Kill all state-driven color paths.
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_border_width(d, 0, 0);
+        lv_obj_set_style_border_width(d, 0, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(d, 0, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(d, 0, 0);
+        lv_obj_set_style_outline_width(d, 0, LV_STATE_PRESSED);
+        lv_obj_set_style_outline_width(d, 0, LV_STATE_FOCUSED);
+        lv_obj_set_style_shadow_width(d, 0, 0);
+        // Pin bg_color in every state so no theme override tints an
+        // unselected dot.
+        lv_obj_set_style_bg_color(d, lvhex(C_LINE), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_color(d, lvhex(C_LINE), LV_STATE_FOCUSED);
         s_settingsDots[i] = d;
     }
 
@@ -684,54 +1305,60 @@ void watchUiBegin() {
     lv_obj_set_style_bg_color(scr, lvhex(C_BG), 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
 
-    // Tabview: two tabs, big enough tap targets for a wrist screen.
-    // The built-in tab bar is HIDDEN (tab_bar_size = 0) and replaced with
-    // a manual 3-button strip below. Every previous attempt to tame the
-    // "italic Files" glyph fight was against LVGL's default theme — the
-    // theme applies text_font_large + transform on checked tab items and
-    // overrides local-style pins in ways that vary between LVGL versions.
-    // Building the strip ourselves = zero theme interference = no way for
-    // the checked button's text to render differently.
-    lv_obj_t* tv = lv_tabview_create(scr);
-    s_tabView = tv;
-    lv_obj_set_size(tv, LCD_W, LCD_H);
-    lv_tabview_set_tab_bar_size(tv, 0);   // hide built-in bar
-    lv_obj_set_style_bg_color(tv, lvhex(C_BG), 0);
+    // Manual 3-container tab system.
+    //
+    // We used to use lv_tabview here, but its class handlers competed with
+    // our own for LV_EVENT_GESTURE and for LV_EVENT_VALUE_CHANGED — the
+    // net effect was that Settings-page swipes never advanced past page 0
+    // AND every tab change triggered a redundant reset. Rebuilt as three
+    // plain lv_obj containers on the screen with manual show/hide via
+    // showTab(). Zero LVGL class-handler interference; every tab change
+    // and page change is fully driven by our own code with no animation.
+    //
+    // Shift the tab CONTENT area down so the manual tab strip fits above.
+    // Strip origin is STRIP_PAD_TOP (not 0) so the button row sits below
+    // the AMOLED's curved top bezel. Total top footprint = STRIP_PAD_TOP +
+    // STRIP_H.
+    const int stripY   = STRIP_PAD_TOP;
+    const int contentY = STRIP_PAD_TOP + STRIP_H;
+    const int tabW     = LCD_W;
+    const int tabH     = LCD_H - contentY;
 
-    // The built-in tab bar is hidden (tab_bar_size = 0 above). All the
-    // former styling / child-iteration is gone — we own the strip now.
-    lv_obj_set_style_anim_duration(tv, 0, 0);
-    lv_obj_set_scroll_snap_x(tv, LV_SCROLL_SNAP_NONE);
-    lv_obj_set_scroll_snap_y(tv, LV_SCROLL_SNAP_NONE);
-    lv_obj_set_style_anim_duration(tv, 0, LV_STATE_SCROLLED);
+    auto makeTabContainer = [&]() {
+        lv_obj_t* c = lv_obj_create(scr);
+        lv_obj_remove_style_all(c);
+        lv_obj_set_size(c, tabW, tabH);
+        lv_obj_set_pos (c, 0, contentY);
+        lv_obj_set_style_bg_color(c, lvhex(C_BG), 0);
+        lv_obj_set_style_bg_opa  (c, LV_OPA_COVER, 0);
+        lv_obj_set_style_pad_all (c, 0, 0);
+        return c;
+    };
 
-    s_tabHome  = lv_tabview_add_tab(tv, "H");
-    s_tabFiles = lv_tabview_add_tab(tv, "F");
-    s_tabSet   = lv_tabview_add_tab(tv, "S");
+    s_tabHome  = makeTabContainer();
+    s_tabFiles = makeTabContainer();
+    s_tabSet   = makeTabContainer();
     buildHomeTab(s_tabHome);
     buildFilesTab(s_tabFiles);
     buildSettingsTab(s_tabSet);
 
-    // ---- Manual tab strip -----------------------------------------------
-    // Since we hid LVGL's built-in tab bar (tab_bar_size=0), draw our own.
-    // Every attempt to make LVGL's tab_bar behave — pinning text_font on
-    // the container, on LV_PART_ITEMS, on the child buttons, on the
-    // button's label — was defeated by the theme. Owning the strip means
-    // no theme can override our font.
-    //
-    // Also pushes the tabview's content down by the strip height so the
-    // strip doesn't cover Home/Files/Settings content. STRIP_H is now a
-    // file-scope constant (see top of file) so makeSettingsPage() can
-    // reference the same value.
+    // s_tabView kept non-null as a "UI is up" flag — legacy code that
+    // checks `if (s_tabView)` still works, but nothing else uses it.
+    s_tabView = s_tabHome;
 
-    // Shift tabview content down so the strip fits above.
-    lv_obj_set_pos (tv, 0, STRIP_H);
-    lv_obj_set_size(tv, LCD_W, LCD_H - STRIP_H);
+    // Hide Files and Settings; Home stays visible on boot.
+    lv_obj_add_flag(s_tabFiles, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_tabSet,   LV_OBJ_FLAG_HIDDEN);
+
+    // ---- Manual tab strip -----------------------------------------------
+    // stripY / contentY were computed above where the tab containers are
+    // built. Tab strip sits above the containers, buttons in the strip
+    // drive showTab() to swap containers.
 
     lv_obj_t* strip = lv_obj_create(scr);
     lv_obj_remove_style_all(strip);
     lv_obj_set_size(strip, LCD_W, STRIP_H);
-    lv_obj_set_pos (strip, 0, 0);
+    lv_obj_set_pos (strip, 0, stripY);
     lv_obj_set_style_bg_color(strip, lvhex(C_SURFACE), 0);
     lv_obj_set_style_bg_opa(strip, LV_OPA_COVER, 0);
     lv_obj_set_style_border_side(strip, LV_BORDER_SIDE_BOTTOM, 0);
@@ -739,9 +1366,11 @@ void watchUiBegin() {
     lv_obj_set_style_border_color(strip, lvhex(C_LINE), 0);
     lv_obj_clear_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
 
+    // s_manualLbls / s_manualUnder are now FILE-SCOPE (see near top of
+    // file). This lets manualStripRepaint() re-tint the active tab from
+    // any handler — click, VALUE_CHANGED, or gesture. s_manualBtns stays
+    // local (nothing outside this scope needs it).
     static lv_obj_t* s_manualBtns  [3] = { nullptr };
-    static lv_obj_t* s_manualLbls  [3] = { nullptr };
-    static lv_obj_t* s_manualUnder [3] = { nullptr };
     const char* iconChars [3] = { LV_SYMBOL_HOME, LV_SYMBOL_FILE, LV_SYMBOL_SETTINGS };
     // Bug-hunt R1: "Set" was an accidental truncation ("Set" reads as the
     // verb, not "Settings"). Full word fits inside btnW=110 at Montserrat
@@ -760,7 +1389,7 @@ void watchUiBegin() {
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_add_event_cb(btn, [](lv_event_t* e) {
             int idx = (int)(intptr_t)lv_event_get_user_data(e);
-            if (s_tabView) lv_tabview_set_active(s_tabView, idx, LV_ANIM_OFF);
+            showTab(idx);   // hides/shows containers + updates strip + resets page
         }, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         s_manualBtns[i] = btn;
 
@@ -775,85 +1404,59 @@ void watchUiBegin() {
         lv_obj_center(lbl);
         s_manualLbls[i] = lbl;
 
-        // Bottom underline that lights on the active tab.
+        // Bottom underline — always fully opaque, visibility controlled
+        // via LV_OBJ_FLAG_HIDDEN in manualStripRepaint. Starting hidden
+        // for all three; initial paint below unhides tab 0.
         lv_obj_t* u = lv_obj_create(btn);
         lv_obj_remove_style_all(u);
         lv_obj_set_size(u, btnW - 20, 3);
         lv_obj_align(u, LV_ALIGN_BOTTOM_MID, 0, -2);
-        lv_obj_set_style_bg_opa(u, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_bg_opa(u, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(u, lvhex(C_ACCENT), 0);
         lv_obj_set_style_radius(u, 2, 0);
+        lv_obj_add_flag(u, LV_OBJ_FLAG_HIDDEN);
         s_manualUnder[i] = u;
     }
 
-    auto syncStrip = [&]() {
-        int active = lv_tabview_get_tab_active(s_tabView);
-        for (int i = 0; i < 3; i++) {
-            bool on = (i == active);
-            if (s_manualLbls[i]) {
-                lv_obj_set_style_text_color(s_manualLbls[i],
-                    lvhex(on ? C_TEXT : C_MUTED), 0);
-            }
-            if (s_manualUnder[i]) {
-                lv_obj_set_style_bg_opa(s_manualUnder[i],
-                    on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            }
-        }
-    };
+    manualStripRepaint();  // initial paint (Home active)
 
-    // Reset Settings paging to page 0 + repaint strip whenever the
-    // tabview's active tab changes.
-    lv_obj_add_event_cb(tv, [](lv_event_t*){
-        settingsShowPage(0);
-        int active = lv_tabview_get_tab_active(s_tabView);
-        for (int i = 0; i < 3; i++) {
-            if (s_manualLbls[i]) {
-                lv_obj_set_style_text_color(s_manualLbls[i],
-                    lvhex(i == active ? C_TEXT : C_MUTED), 0);
-            }
-            if (s_manualUnder[i]) {
-                lv_obj_set_style_bg_opa(s_manualUnder[i],
-                    i == active ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
-            }
-        }
-    }, LV_EVENT_VALUE_CHANGED, nullptr);
-
-    syncStrip();  // initial paint (tab 0 active)
-
-    // Swipe-up on the tabview brings the clock back.
-    lv_obj_add_event_cb(tv, [](lv_event_t* e){
+    // Horizontal-gesture handler on the SCREEN. No lv_tabview class
+    // handler to compete with anymore — this is the ONLY code that
+    // reacts to LEFT/RIGHT swipes. TOP is handled by the screen-level
+    // clock-swipe-up handler further down.
+    //
+    // Direction rules:
+    //   Home  (0): LEFT → Files.                RIGHT → nothing.
+    //   Files (1): LEFT → Settings.             RIGHT → Home.
+    //   Set.  (2): LEFT → next page (or stay).  RIGHT → prev page or Files.
+    lv_obj_add_event_cb(scr, [](lv_event_t* e){
         if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
         lv_indev_t* indev = lv_indev_active();
         if (!indev) return;
         lv_dir_t d = lv_indev_get_gesture_dir(indev);
-        if (d == LV_DIR_TOP && !watchUiClockVisible()) watchUiShowClock();
-    }, LV_EVENT_GESTURE, nullptr);
-
-    // Settings-paging gesture: attach on tabview so we run BEFORE the
-    // built-in class handler. On Settings tab, LEFT advances page, RIGHT
-    // retreats page (when > 0). RIGHT on page 0 falls through so the
-    // tabview's own handler jumps back to Files. lv_event_stop_processing
-    // prevents the tabview class handler from running when we consume.
-    lv_obj_add_event_cb(tv, [](lv_event_t* e){
-        if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-        if (lv_tabview_get_tab_active(s_tabView) != 2) return;  // only on Settings
-        lv_indev_t* indev = lv_indev_active();
-        if (!indev) return;
-        lv_dir_t d = lv_indev_get_gesture_dir(indev);
-        if (d == LV_DIR_LEFT) {
-            if (s_settingsPage < SETTINGS_PAGE_COUNT - 1) {
-                settingsShowPage(s_settingsPage + 1);
+        if (d != LV_DIR_LEFT && d != LV_DIR_RIGHT) return;
+        // Bug-hunt R2: don't sneak-change hidden tabs while the clock
+        // overlay is covering the screen — the user sees no change and
+        // is left thinking "the swipe didn't work" while s_activeTab
+        // silently marches. Ignore LEFT/RIGHT while the clock is up;
+        // only the UP-swipe dismiss (see clockGestureCb + the DOWN/UP
+        // scr cb below) may act on clock-time gestures.
+        if (watchUiClockVisible()) return;
+        if (s_activeTab == 2) {           // Settings
+            if (d == LV_DIR_LEFT) {
+                if (s_settingsPage < SETTINGS_PAGE_COUNT - 1)
+                    settingsShowPage(s_settingsPage + 1);
+            } else {  // RIGHT
+                if (s_settingsPage > 0) settingsShowPage(s_settingsPage - 1);
+                else                    showTab(1);   // page 0 → Files
             }
-            lv_indev_wait_release(indev);
-            lv_event_stop_processing(e);
-        } else if (d == LV_DIR_RIGHT) {
-            if (s_settingsPage > 0) {
-                settingsShowPage(s_settingsPage - 1);
-                lv_indev_wait_release(indev);
-                lv_event_stop_processing(e);
-            }
-            // else: page 0 + right swipe → let tabview jump back to Files
+        } else if (s_activeTab == 1) {    // Files
+            showTab(d == LV_DIR_LEFT ? 2 : 0);
+        } else {                          // Home
+            if (d == LV_DIR_LEFT) showTab(1);
         }
+        lv_indev_wait_release(indev);
+        lv_event_stop_processing(e);
     }, LV_EVENT_GESTURE, nullptr);
 
     // Toast on lv_layer_top() so watchUiFlash() from any tab is visible.
@@ -889,15 +1492,74 @@ void watchUiBegin() {
     lv_obj_align(s_bannerLbl, LV_ALIGN_TOP_MID, 0, 70);
     lv_obj_add_flag(s_bannerLbl, LV_OBJ_FLAG_HIDDEN);
 
+    // Persistent "RUNNING <script>" banner on lv_layer_top so it's
+    // visible from EVERY tab — Home, Files, Settings, even the PIN
+    // pad or clock overlay. Toggled by watchUiSetScriptState().
+    s_runBanner = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_runBanner);
+    lv_obj_set_size(s_runBanner, LCD_W, 40);
+    lv_obj_set_pos(s_runBanner, 0, 0);
+    lv_obj_set_style_bg_color(s_runBanner, lvhex(0xE5A93A), 0);   // orange
+    lv_obj_set_style_bg_opa(s_runBanner, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_runBanner, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_runBanner, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_runBanner, LV_OBJ_FLAG_HIDDEN);
+    s_runBannerLbl = lv_label_create(s_runBanner);
+    lv_label_set_text(s_runBannerLbl, "");
+    lv_obj_set_style_text_color(s_runBannerLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_runBannerLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_letter_space(s_runBannerLbl, 0, 0);
+    lv_obj_set_width(s_runBannerLbl, LCD_W - 20);
+    lv_obj_set_style_text_align(s_runBannerLbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_runBannerLbl, LV_LABEL_LONG_DOT);
+    lv_obj_center(s_runBannerLbl);
+
     // Swipe-UP anywhere on the screen brings the clock back. The tabview's
     // own gesture handler is one place; attaching a screen-level fallback
     // too catches gestures inside scrollable tab-content that would
     // otherwise be consumed by the scroll.
     lv_obj_add_event_cb(lv_scr_act(), [](lv_event_t* e){
         if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-        lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
-        if (d == LV_DIR_TOP && !watchUiClockVisible()) watchUiShowClock();
+        lv_indev_t* indev = lv_indev_active();
+        if (!indev) return;
+        lv_dir_t d = lv_indev_get_gesture_dir(indev);
+        // Screen-level handler for BOTH show + hide directions. Attaching
+        // the hide handler to the clock's own overlay (which sits on
+        // lv_layer_top) was unreliable — LVGL 9 didn't route gesture
+        // events to layer_top children in the same way as regular screen
+        // children, so the wearer was stuck on the clock. scr fires for
+        // every touch regardless of what layer is on top, so both
+        // directions work.
+        if (d == LV_DIR_BOTTOM && !watchUiClockVisible()) {
+            watchUiShowClock();
+        } else if (d == LV_DIR_TOP && watchUiClockVisible()) {
+            // PIN gate: only prompt if a PIN is actually set; otherwise
+            // dismiss instantly.
+            if (!s_pinValue[0]) {
+                watchUiHideClock();
+            } else {
+                watchUiShowPinPad("Enter PIN", "", [](bool ok, const char* pin, bool /*wantRemove*/){
+                    if (!ok) return;
+                    if (s_duressValue[0] && strcmp(pin, s_duressValue) == 0) {
+                        s_pendingExtras.want_duress = true;
+                        watchUiHideClock();
+                        return;
+                    }
+                    if (strcmp(pin, s_pinValue) == 0) watchUiHideClock();
+                    else                              watchUiFlash("Wrong PIN");
+                });
+            }
+        }
     }, LV_EVENT_GESTURE, nullptr);
+
+    // NOTE: an earlier version called killAllAnimsRec(lv_scr_act()) here
+    // to nuke every button-press fade and transition. It rebooted the
+    // watch on any touch — lv_obj_set_style_transition(obj, nullptr, ...)
+    // on the wrong part/state combos crashed LVGL's transition subsystem
+    // the next time a state changed. Left disabled until we find a safe
+    // per-widget kill. Per-widget style pins already zero anim_duration on
+    // the switches (see makeBigSwitchRow) and the tab-strip buttons
+    // remove_style_all so the theme's press-fade never applies there.
 
     // Clock face — shown at boot; swipe down to reveal the tabview.
     watchUiShowClock();
@@ -913,17 +1575,42 @@ void watchUiBegin() {
 static char s_lastClockText[8] = "";
 
 static void clockGestureCb(lv_event_t* e) {
+    // Bug-hunt R1: the clock is now parented to lv_scr_act() (was
+    // lv_layer_top()), so gestures DO fire directly on the clock root.
+    // Handling the dismiss HERE guarantees the swipe-up reaches us even
+    // if event-bubbling to scr's cb is suppressed (a scrollable ancestor
+    // eating the vertical drag, a same-touch reclassification into a
+    // horizontal gesture that stop_processing'd the scr cb chain, etc.).
+    // Belt-and-suspenders with the scr-level cb.
     if (lv_event_get_code(e) != LV_EVENT_GESTURE) return;
-    lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
-    if (d == LV_DIR_BOTTOM) watchUiHideClock();   // "swipe down to reveal"
-    // Tapping the clock also dismisses — most users try that first.
+    lv_indev_t* indev = lv_indev_active();
+    if (!indev) return;
+    lv_dir_t d = lv_indev_get_gesture_dir(indev);
+    if (d != LV_DIR_TOP) return;
+    if (!watchUiClockVisible()) return;
+    // No PIN — dismiss directly; PIN set — challenge (duress path handled
+    // in the pad callback, matches the scr-level handler exactly).
+    if (!s_pinValue[0]) {
+        watchUiHideClock();
+        return;
+    }
+    watchUiShowPinPad("Enter PIN", "", [](bool ok, const char* pin, bool /*wantRemove*/){
+        if (!ok) return;
+        if (s_duressValue[0] && strcmp(pin, s_duressValue) == 0) {
+            s_pendingExtras.want_duress = true;
+            watchUiHideClock();
+            return;
+        }
+        if (strcmp(pin, s_pinValue) == 0) watchUiHideClock();
+        else                              watchUiFlash("Wrong PIN");
+    });
 }
-static void clockClickCb(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    watchUiHideClock();
+static void clockClickCb(lv_event_t* /*e*/) {
+    // No-op — swipe UP dismisses per user request.
 }
 
 void watchUiShowClock() {
+    if (s_bricked) return;    // brick failsafe: no clock overlay
     if (s_clockRoot) {
         lv_obj_clear_flag(s_clockRoot, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -933,7 +1620,14 @@ void watchUiShowClock() {
     // Seconds() call below actually updates the label instead of skipping
     // as an "unchanged" write.
     s_lastClockText[0] = '\0';
-    s_clockRoot = lv_obj_create(lv_layer_top());
+    // Clock overlay parents to lv_scr_act (NOT lv_layer_top). LVGL 9
+    // does not bubble gesture events from layer_top children up to
+    // scr_act, which is where our screen-level swipe handler lives —
+    // putting the clock on scr_act as its top child means gestures on
+    // the clock fire on the clock, bubble to scr_act, and reach our
+    // handler. Flash + banner overlays remain on lv_layer_top so they
+    // paint above the clock.
+    s_clockRoot = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(s_clockRoot);
     lv_obj_set_size(s_clockRoot, LCD_W, LCD_H);
     lv_obj_set_pos(s_clockRoot, 0, 0);
@@ -941,6 +1635,7 @@ void watchUiShowClock() {
     lv_obj_set_style_bg_opa(s_clockRoot, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s_clockRoot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_clockRoot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(s_clockRoot);   // top of scr's z-order
     lv_obj_add_event_cb(s_clockRoot, clockGestureCb, LV_EVENT_GESTURE, nullptr);
     lv_obj_add_event_cb(s_clockRoot, clockClickCb,   LV_EVENT_CLICKED, nullptr);
 
@@ -987,10 +1682,24 @@ void watchUiShowClock() {
 
 void watchUiHideClock() {
     if (!s_clockRoot) return;
-    lv_obj_del(s_clockRoot);
+    // CRITICAL: this function is called SYNCHRONOUSLY from the clock's own
+    // event callback (clockGestureCb / clockClickCb attached to s_clockRoot).
+    // lv_obj_del() on the target of an in-flight event frees memory that
+    // LVGL 9's indev still points to (act_obj, gesture tracker, last_pressed
+    // ref) — the immediate delete looks fine, but the NEXT touch dispatches
+    // through the freed pointer and the S3 hits LoadProhibited, reboots,
+    // and boot puts the clock right back — the exact "swipe down works,
+    // any touch reboots to clock" symptom.
+    //
+    // Fix: NULL the tracking pointers FIRST so watchUiClockVisible() and
+    // watchUiSetClockSeconds() ignore the doomed object immediately, then
+    // schedule the delete via lv_obj_del_async() so LVGL finishes the
+    // current event dispatch before actually freeing the widget.
+    lv_obj_t* doomed = s_clockRoot;
     s_clockRoot = nullptr;
     s_clockTime = nullptr;
     s_clockHint = nullptr;
+    lv_obj_del_async(doomed);
 }
 
 bool watchUiClockVisible() {
@@ -1315,9 +2024,6 @@ void watchUiSetFileList(const std::vector<String>& names,
 
         lv_obj_t* row = lv_obj_create(s_filesList);
         lv_obj_remove_style_all(row);
-        // Curvy safe-area: row width and horizontal padding fit inside the
-        // rounded-corner visible area so file names + action buttons don't
-        // clip at the panel edge.
         lv_obj_set_size(row, LCD_W - 2 * SAFE_X, 68);
         lv_obj_set_style_pad_hor(row, 8, 0);
         lv_obj_set_style_pad_ver(row, 8, 0);
@@ -1330,6 +2036,18 @@ void watchUiSetFileList(const std::vector<String>& names,
                                    LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_STATE_PRESSED);
+        // Row itself is clickable: tapping the name area (anywhere not on
+        // a button) selects THIS script + jumps to Home so the wearer can
+        // Play/Stop it. LVGL 9: children (buttons) with their own click
+        // callbacks eat their clicks first before bubbling, so tapping a
+        // button doesn't ALSO trigger the row-click.
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, [](lv_event_t* e){
+            const char* name = (const char*)lv_event_get_user_data(e);
+            if (!name) return;
+            watchUiSetSelectedScript(name);
+            showTab(0);   // jump to Home
+        }, LV_EVENT_CLICKED, (void*)nameCstr);
 
         lv_obj_t* lbl = lv_label_create(row);
         lv_label_set_text(lbl, nameCstr);
@@ -1358,22 +2076,61 @@ void watchUiSetFileList(const std::vector<String>& names,
         bool isAutostart = (autostartName.length() > 0 &&
                             autostartName == n);
 
-        // ⏱ Autostart — filled yellow when set, muted grey when not.
-        lv_obj_t* starBtn = lv_btn_create(row);
-        lv_obj_set_size(starBtn, 52, 52);
-        lv_obj_set_style_bg_color(starBtn,
-            lvhex(isAutostart ? 0xE5A93A : 0x2A2A30), 0);
-        lv_obj_set_style_radius(starBtn, 8, 0);
-        lv_obj_set_style_shadow_width(starBtn, 0, 0);
-        lv_obj_add_event_cb(starBtn, filesStarCb, LV_EVENT_CLICKED, (void*)nameCstr);
-        lv_obj_t* starLbl = lv_label_create(starBtn);
-        // No star glyph in the built-in montserrat FA subset; use upload
-        // arrow ("pin") with a bright-vs-dim colour tell.
-        lv_label_set_text(starLbl, LV_SYMBOL_UPLOAD);
-        lv_obj_set_style_text_color(starLbl,
+        // Autorun/autostart button. Vivid orange when THIS script is the
+        // stored bootscript, muted gray otherwise. Tapping cycles the
+        // relationship:
+        //   * on any OTHER script       → make this script the bootscript
+        //     (writes boot_script = <this>, ensuring ONLY one script at
+        //     a time is armed — the .ino overwrites the pref).
+        //   * on the CURRENTLY-armed one → CLEAR the bootscript (pref
+        //     wiped, no script fires on next trigger).
+        // If neither autorun nor autostart is enabled in Settings, tap
+        // toasts "not enabled".
+        lv_obj_t* bootBtn = lv_btn_create(row);
+        lv_obj_set_size(bootBtn, 52, 52);
+        uint32_t bootColor = isAutostart ? 0xE5A93A : 0x2A2A30;  // orange when armed, dark-gray otherwise
+        lv_obj_set_style_bg_color(bootBtn, lvhex(bootColor), 0);
+        lv_obj_set_style_bg_color(bootBtn, lvhex(bootColor), LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(bootBtn, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bootBtn, 8, 0);
+        lv_obj_set_style_shadow_width(bootBtn, 0, 0);
+        killWidgetAnims(bootBtn);
+        // user_data is the raw nameCstr pointer — no bit-tagging. The
+        // earlier version OR'd 0x1 into the pointer's LSB to carry an
+        // "is currently armed" flag, which corrupted the pointer when
+        // std::string's internal buffer wasn't even-byte-aligned. Use
+        // the file-scope s_currentAutostart String to test armed state
+        // at click time instead.
+        lv_obj_add_event_cb(bootBtn, [](lv_event_t* e){
+            const char* name = (const char*)lv_event_get_user_data(e);
+            if (!name) return;
+            bool wasArmed = (s_currentAutostart.length() > 0 &&
+                             s_currentAutostart == name);
+            bool autorunEnabled = s_settingSw[SET_AUTOSTART] &&
+                lv_obj_has_state(s_settingSw[SET_AUTOSTART], LV_STATE_CHECKED);
+            bool autostartOnAttach = s_settingSw[SET_AUTOATTACH] &&
+                lv_obj_has_state(s_settingSw[SET_AUTOATTACH], LV_STATE_CHECKED);
+            if (!autorunEnabled && !autostartOnAttach) {
+                watchUiFlash("Enable Autorun or Autostart first");
+                return;
+            }
+            s_pendingAction.has_toggle_autostart = true;
+            if (wasArmed) {
+                s_pendingAction.autostart_name[0] = '\0';
+                watchUiFlash("Bootscript cleared");
+            } else {
+                strncpy(s_pendingAction.autostart_name, name,
+                        sizeof(s_pendingAction.autostart_name) - 1);
+                s_pendingAction.autostart_name[sizeof(s_pendingAction.autostart_name) - 1] = '\0';
+                watchUiFlash(LV_SYMBOL_OK "  Bootscript set");
+            }
+        }, LV_EVENT_CLICKED, (void*)nameCstr);
+        lv_obj_t* bootLbl = lv_label_create(bootBtn);
+        lv_label_set_text(bootLbl, LV_SYMBOL_UPLOAD);
+        lv_obj_set_style_text_color(bootLbl,
             isAutostart ? lv_color_white() : lvhex(C_MUTED), 0);
-        lv_obj_set_style_text_font(starLbl, &lv_font_montserrat_22, 0);
-        lv_obj_center(starLbl);
+        lv_obj_set_style_text_font(bootLbl, &lv_font_montserrat_22, 0);
+        lv_obj_center(bootLbl);
 
         // ▶ Run — green square
         lv_obj_t* runBtn = lv_btn_create(row);
@@ -1382,6 +2139,7 @@ void watchUiSetFileList(const std::vector<String>& names,
         lv_obj_set_style_radius(runBtn, 8, 0);
         lv_obj_set_style_shadow_width(runBtn, 0, 0);
         lv_obj_set_style_margin_left(runBtn, 6, 0);
+        killWidgetAnims(runBtn);
         lv_obj_add_event_cb(runBtn, filesRunCb, LV_EVENT_CLICKED, (void*)nameCstr);
         lv_obj_t* runLbl = lv_label_create(runBtn);
         lv_label_set_text(runLbl, LV_SYMBOL_PLAY);
@@ -1396,6 +2154,7 @@ void watchUiSetFileList(const std::vector<String>& names,
         lv_obj_set_style_radius(delBtn, 8, 0);
         lv_obj_set_style_shadow_width(delBtn, 0, 0);
         lv_obj_set_style_margin_left(delBtn, 6, 0);
+        killWidgetAnims(delBtn);
         lv_obj_add_event_cb(delBtn, filesDelCb, LV_EVENT_CLICKED, (void*)nameCstr);
         lv_obj_t* delLbl = lv_label_create(delBtn);
         lv_label_set_text(delLbl, LV_SYMBOL_TRASH);
@@ -1431,6 +2190,178 @@ void watchUiRefreshSettings(bool wifi, bool bt, bool btdisc,
 
 void watchUiSetAutostartToggle(bool on) {
     syncSw(SET_AUTOSTART, on);
+}
+void watchUiSetAutoattachToggle(bool on) {
+    syncSw(SET_AUTOATTACH, on);
+}
+
+bool watchUiVbusPresent() {
+    // Bug-hunt: if the PMU wasn't up on the first watchUiBegin() attempt
+    // (I2C not warmed up yet, AXP2101 slow to respond), a caller polling
+    // for VBUS here would just get `false` forever until something else
+    // happened to call tryInitPMU() again. Retry the init lazily right
+    // in this hot path — tryInitPMU() has its own 2 s throttle so this
+    // is cheap.
+    if (!s_pmuReady) tryInitPMU();
+    if (!s_pmuReady) return false;
+    // Two-signal check. Some AXP2101 revisions clear isVbusIn under
+    // specific charge-state conditions but still report the actual
+    // voltage over 4 V.
+    if (s_pmu.isVbusIn()) return true;
+    uint16_t mv = s_pmu.getVbusVoltage();
+    return mv > 4000;
+}
+
+void watchUiApplyBrightness(int pct) {
+    if (pct < 5)   pct = 5;
+    if (pct > 100) pct = 100;
+    // Screen.setBrightness now expects percent (0..100) directly — it's
+    // the software overlay from QWavey/AMOLEDBrightness, not MIPI DCS.
+    Screen.setBrightness((uint8_t)pct);
+}
+
+void watchUiRefreshExtras(bool screen_sleep_on, int brightness_pct,
+                          const char* pin_value, const char* duress_value) {
+    s_screenSleepOn = screen_sleep_on;
+    syncSw(SET_SCREEN_SLEEP, screen_sleep_on);
+    if (brightness_pct < 10)  brightness_pct = 10;
+    if (brightness_pct > 100) brightness_pct = 100;
+    s_brightnessPct = brightness_pct;
+    if (s_brightVal) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%%", s_brightnessPct);
+        lv_label_set_text(s_brightVal, buf);
+    }
+    strncpy(s_pinValue, pin_value ? pin_value : "", sizeof(s_pinValue) - 1);
+    s_pinValue[sizeof(s_pinValue) - 1] = '\0';
+    strncpy(s_duressValue, duress_value ? duress_value : "", sizeof(s_duressValue) - 1);
+    s_duressValue[sizeof(s_duressValue) - 1] = '\0';
+}
+
+// Enter a full-black failsafe screen — used when the "Brick Firmware"
+// action fires. Deletes every widget on scr and every top-layer overlay,
+// paints a black lv_obj covering the whole panel, disables touch input
+// so the ROM bootloader can be reached only via BOOT+RESET.
+void watchUiEnterBrickBlackscreen() {
+    // Latch bricked FIRST so any GESTURE dispatched by lv_task_handler()
+    // during/after the clean below early-outs of showTab / showClock /
+    // showPinPad and cannot re-materialize widgets on the black failsafe.
+    s_bricked = true;
+    // Wipe the active screen — no toasts, no clock, no tabs.
+    lv_obj_clean(lv_scr_act());
+    lv_obj_clean(lv_layer_top());
+    // Cover with a pure-black opaque rect that ignores touch.
+    lv_obj_t* black = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(black);
+    lv_obj_set_size(black, LCD_W, LCD_H);
+    lv_obj_set_pos(black, 0, 0);
+    lv_obj_set_style_bg_color(black, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(black, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(black, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(black, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_invalidate(lv_scr_act());
+    // Null all previously-tracked handles so later code paths that touch
+    // s_scriptLbl / s_bannerLbl / etc. skip cleanly.
+    s_statusLbl = nullptr; s_scriptLbl = nullptr; s_progress = nullptr;
+    s_apSsidLbl = nullptr; s_apPassLbl = nullptr; s_ipLbl = nullptr;
+    s_clientsLbl = nullptr; s_battLbl = nullptr; s_flashLbl = nullptr;
+    s_bannerLbl = nullptr; s_runBanner = nullptr; s_runBannerLbl = nullptr;
+    s_stopBtn = nullptr; s_playBtn = nullptr;
+    s_playLbl = nullptr; s_selectedLbl = nullptr; s_filesList = nullptr;
+    s_filesEmpty = nullptr; s_lanStatusLbl = nullptr; s_brightVal = nullptr;
+    s_clockRoot = nullptr; s_clockTime = nullptr; s_clockHint = nullptr;
+    s_tabHome = nullptr; s_tabFiles = nullptr; s_tabSet = nullptr;
+    s_tabView = nullptr;
+    for (int i = 0; i < 3; i++) { s_manualLbls[i] = nullptr; s_manualUnder[i] = nullptr; }
+    for (int i = 0; i < SETTINGS_PAGE_COUNT; i++) { s_settingsPages[i] = nullptr; s_settingsDots[i] = nullptr; }
+    for (int i = 0; i < SET_COUNT; i++) s_settingSw[i] = nullptr;
+}
+
+// idle=0 / running=1 / paused=2 — controls dim on Stop and Play icon.
+void watchUiSetScriptState(int state) {
+    s_scriptState = state;
+    if (s_stopBtn) {
+        lv_obj_set_style_bg_opa(s_stopBtn,
+            state == 0 ? LV_OPA_40 : LV_OPA_COVER, 0);
+        // Force invalidate — LVGL doesn't always re-render on a
+        // state-selector-0 style change during a running frame, so the
+        // wearer sometimes saw the Stop button stay dim even after the
+        // script started. Explicit invalidate schedules a redraw.
+        lv_obj_invalidate(s_stopBtn);
+    }
+    if (s_playBtn) {
+        uint32_t bg = (state == 1) ? 0xE5A93A : C_OK;
+        const char* icon = (state == 1) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY;
+        lv_obj_set_style_bg_color(s_playBtn, lvhex(bg), 0);
+        lv_obj_set_style_bg_color(s_playBtn, lvhex(bg), LV_STATE_PRESSED);
+        if (s_playLbl) lv_label_set_text(s_playLbl, icon);
+        lv_obj_invalidate(s_playBtn);
+    }
+    // Persistent top-of-screen banner visible from ANY tab. Only shown
+    // while state != 0. On state 0 hide + rearm.
+    if (s_runBanner && s_runBannerLbl) {
+        if (state == 0) {
+            lv_obj_add_flag(s_runBanner, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            char buf[96];
+            const char* name = s_selectedName[0] ? s_selectedName : "script";
+            if (state == 1) {
+                snprintf(buf, sizeof(buf), LV_SYMBOL_PLAY "  RUNNING  %s", name);
+                lv_obj_set_style_bg_color(s_runBanner, lvhex(0xE5A93A), 0);
+            } else {
+                snprintf(buf, sizeof(buf), LV_SYMBOL_PAUSE "  PAUSED  %s", name);
+                lv_obj_set_style_bg_color(s_runBanner, lvhex(C_ACCENT), 0);
+            }
+            lv_label_set_text(s_runBannerLbl, buf);
+            lv_obj_clear_flag(s_runBanner, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_runBanner);
+        }
+        lv_obj_invalidate(s_runBanner);
+    }
+    // Persistent status label — replaces the 4-second toast so the
+    // wearer sees "RUNNING xyz.txt" for the entire lifetime of the
+    // script, not just the first four seconds. State 0 restores the
+    // idle "Ready" line.
+    if (s_statusLbl) {
+        char buf[96];
+        const char* name = s_selectedName[0] ? s_selectedName : "script";
+        if (state == 1) {
+            snprintf(buf, sizeof(buf), LV_SYMBOL_PLAY "  RUNNING  %s", name);
+            lv_label_set_text(s_statusLbl, buf);
+            lv_obj_set_style_text_color(s_statusLbl, lvhex(0xE5A93A), 0);
+        } else if (state == 2) {
+            snprintf(buf, sizeof(buf), LV_SYMBOL_PAUSE "  PAUSED  %s", name);
+            lv_label_set_text(s_statusLbl, buf);
+            lv_obj_set_style_text_color(s_statusLbl, lvhex(C_ACCENT), 0);
+        } else {
+            lv_label_set_text(s_statusLbl, "Ready");
+            lv_obj_set_style_text_color(s_statusLbl, lvhex(C_TEXT), 0);
+        }
+    }
+    lv_obj_invalidate(lv_scr_act());
+}
+
+void watchUiSetSelectedScript(const char* name) {
+    strncpy(s_selectedName, name ? name : "", sizeof(s_selectedName) - 1);
+    s_selectedName[sizeof(s_selectedName) - 1] = '\0';
+    // Bug-hunt R2: the .ino keeps its OWN copy of the selection in
+    // `selectedScriptName` (only that copy is used when Play fires), and
+    // its ONLY assignment path is through the WatchUiPendingSettings bridge
+    // — has_selected + selected_name. Nothing in this file was setting
+    // those, so Play always toasted "No script selected". Queue the bridge
+    // fields alongside the local cache so both stay in sync.
+    s_pending.has_selected = true;
+    strncpy(s_pending.selected_name, s_selectedName,
+            sizeof(s_pending.selected_name) - 1);
+    s_pending.selected_name[sizeof(s_pending.selected_name) - 1] = '\0';
+    if (!s_selectedLbl) return;
+    if (!*s_selectedName) {
+        lv_label_set_text(s_selectedLbl, "");
+    } else {
+        char buf[96];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_FILE "  %s", s_selectedName);
+        lv_label_set_text(s_selectedLbl, buf);
+    }
 }
 
 void watchUiSetDeadnetToggle(bool on) {
@@ -1565,6 +2496,7 @@ void watchUiShowWalkthrough(const char* ssid, const char* psk, const char* ip,
     lv_obj_set_style_bg_color(skip, lvhex(C_SURFACE), 0);
     lv_obj_set_style_radius(skip, 8, 0);
     lv_obj_set_style_shadow_width(skip, 0, 0);
+    killWidgetAnims(skip);
     lv_obj_add_event_cb(skip, wtSkipCb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* sk = lv_label_create(skip);
     lv_label_set_text(sk, "Skip");
@@ -1610,6 +2542,7 @@ void watchUiShowWalkthrough(const char* ssid, const char* psk, const char* ip,
     lv_obj_set_style_bg_color(s_wtNextBtn, lvhex(C_ACCENT), 0);
     lv_obj_set_style_radius(s_wtNextBtn, 12, 0);
     lv_obj_set_style_shadow_width(s_wtNextBtn, 0, 0);
+    killWidgetAnims(s_wtNextBtn);
     lv_obj_add_event_cb(s_wtNextBtn, wtNextCb, LV_EVENT_CLICKED, nullptr);
     s_wtNextLbl = lv_label_create(s_wtNextBtn);
     lv_obj_set_style_text_color(s_wtNextLbl, lv_color_white(), 0);

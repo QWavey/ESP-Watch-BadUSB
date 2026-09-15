@@ -84,6 +84,12 @@ struct WatchUiPendingSettings {
     bool has_silent;        bool silent_on;
     bool has_logging;       bool logging_on;
     bool has_com;           bool com_on;
+    bool has_screen_sleep;  bool screen_sleep_on;   // new: user-optional
+    bool has_brightness;    int  brightness_pct;    // 10..100, +/- steps
+    bool has_pin;           char pin_value[8];      // "" clears; 4 digits
+    bool has_duress;        char duress_value[8];   // "" clears; 4 digits
+    bool has_selected;      char selected_name[64]; // script from Files→Home
+    bool want_play;                                   // Home ▶ pressed
     bool want_reboot;
     bool want_factory_reset;
 };
@@ -91,15 +97,37 @@ struct WatchUiPendingSettings {
 WatchUiPendingSettings watchUiConsumePendingSettings();
 void watchUiRefreshSettings(bool wifi, bool bt, bool btdisc,
                             bool led,  bool silent, bool logging, bool com);
+void watchUiRefreshExtras(bool screen_sleep_on, int brightness_pct,
+                          const char* pin_value, const char* duress_value);
+// Apply display brightness (0..100 percent) via MIPI DCS 0x51. Wraps
+// the ScreenClass instance so callers outside WatchUI.cpp don't need to
+// include the AMOLED driver header.
+void watchUiApplyBrightness(int pct);
+// Returns true if VBUS (USB-C power) is currently detected by the
+// AXP2101 PMU. Works EVEN when Silent USB is on — VBUS presence is a
+// hardware signal, independent of whether we've called USB.begin().
+// Used by the "Autostart on USB attach" trigger.
+bool watchUiVbusPresent();
 void watchUiSetAutostartToggle(bool on);
+// Enter a full-black failsafe screen — used when firmware is "bricked"
+// via Settings. Deletes all UI (except the black overlay), disables
+// touches, blanks the AMOLED to pure black.
+void watchUiEnterBrickBlackscreen();
+// Mark a script running/paused/idle — Home's Stop button dims when idle,
+// Play swaps its icon to Pause/Continue when running/paused.
+void watchUiSetScriptState(int state);   // 0=idle, 1=running, 2=paused
+void watchUiSetSelectedScript(const char* name);
 
 // ---- Autostart / Reset-to-standard / Brick firmware --------------------
 struct WatchUiPendingExtras {
-    bool has_autostart;   bool autostart_on;
+    bool has_autostart;   bool autostart_on;   // fires on ESP BOOT
+    bool has_autoattach;  bool autoattach_on;  // fires on USB-C ATTACH
     bool want_reset_std;   // Reset every user toggle to OFF + wipe boot_script
     bool want_brick;       // Set bricked=true; on next boot only the clock runs
     bool has_deadnet;     bool deadnet_on;   // DeadNet start/stop from AMOLED
+    bool want_duress;      // Duress code was entered — wipe scripts + brick
 };
+void watchUiSetAutoattachToggle(bool on);
 void watchUiSetDeadnetToggle(bool on);
 void watchUiSetLanConnected(bool connected, const char* ssid);
 WatchUiPendingExtras watchUiConsumePendingExtras();

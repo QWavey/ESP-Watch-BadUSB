@@ -3190,13 +3190,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // user's phone. Fix: listen to BOTH keydown (physical keyboards, special
     // keys) AND input (mobile virtual keyboards). Dedupe so a desktop press
     // doesn't fire both.
-    let __lastKeydownAt = 0;
-    let __lastKeydownChar = '';
+    // File-scope cooldown map + helper — used by BOTH the keydown
+    // handler here and the input/beforeinput handler further down.
+    // Every send goes through __justSent(token); a second event within
+    // COOLDOWN_MS of the same token is silently dropped. This kills
+    // the desktop-double-fire and mobile-triple-backspace bugs.
+    li.__recent = li.__recent || new Map();
+    li.__cool   = 120;
+    const __liveJustSent = (token) => {
+        const t = Date.now();
+        if (li.__recent.size > 32) {
+            for (const [k, v] of li.__recent) if (t - v > 2000) li.__recent.delete(k);
+        }
+        const last = li.__recent.get(token);
+        if (last && t - last < li.__cool) return true;
+        li.__recent.set(token, t);
+        return false;
+    };
+    // Expose to the input handler below via closure — see __handleTypingEvent.
+    li.__liveJustSent = __liveJustSent;
 
     li.addEventListener('keydown', (e) => {
         if (!liveTypingOn) return;
         if (e.isComposing || e.keyCode === 229 || e.key === 'Dead' || e.key === 'Process') return; // IME/dead keys
-        // Ctrl/Alt/Gui combos -> send as a key combination
         if ((e.ctrlKey || e.altKey || e.metaKey) && e.key.length === 1) {
             e.preventDefault();
             const mods = [];
@@ -3204,52 +3220,38 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.altKey) mods.push('ALT');
             if (e.metaKey) mods.push('GUI');
             if (e.shiftKey) mods.push('SHIFT');
+            const tok = 'C:' + mods.join(' ') + ' ' + e.key;
+            if (__liveJustSent(tok)) return;
             liveSend({ combo: mods.join(' ') + ' ' + e.key });
-            __lastKeydownAt = Date.now();
-            __lastKeydownChar = '';
             return;
         }
         if (LIVE_SPECIAL_KEYS[e.key]) {
-            if (e.key === 'Tab') e.preventDefault(); // keep focus in the box
+            if (e.key === 'Tab') e.preventDefault();
+            if (__liveJustSent('SP:' + LIVE_SPECIAL_KEYS[e.key])) return;
             liveSendSpecial(LIVE_SPECIAL_KEYS[e.key]);
-            __lastKeydownAt = Date.now();
-            __lastKeydownChar = '';
             return;
         }
         if (e.key.length === 1) {
-            liveSend({ k: e.key }); // physical keyboard printable char
-            __lastKeydownAt = Date.now();
-            __lastKeydownChar = e.key;
+            if (__liveJustSent('T:' + e.key)) return;
+            liveSend({ k: e.key });
         }
     });
 
-    // v4.16: catch mobile virtual-keyboard typing via the `input` event.
-    // e.data is the string that was inserted; e.inputType tells us if it
-    // was a delete. Dedupe against keydown so desktop presses don't fire
-    // both handlers.
-    // v4.17: also listen to `beforeinput` because on Android GBoard the
-    // Backspace fires that event with inputType='deleteContentBackward'
-    // slightly before the `input` event - and my `input` handler's 30 ms
-    // keydown-debounce sometimes swallowed it if a stray keydown fired for
-    // the "physical" backspace keycode too. Handling both events with a
-    // smarter debounce (only skip printable chars, never delete) fixes it.
     const __handleTypingEvent = (e) => {
         if (!liveTypingOn) return;
         const it = e.inputType || '';
-        // ALWAYS handle deletes, regardless of keydown timing.
         if (it.startsWith('delete')) {
+            if (li.__liveJustSent('SP:BACKSPACE')) return;
             liveSendSpecial('BACKSPACE');
             return;
         }
-        // Enter via inputType (mobile).
         if (it === 'insertLineBreak' || it === 'insertParagraph') {
+            if (li.__liveJustSent('SP:ENTER')) return;
             liveSendSpecial('ENTER');
             return;
         }
-        // For inserted text: dedupe against a recent keydown with THE SAME char.
         if (e.data && e.data.length > 0) {
-            const dt = Date.now() - __lastKeydownAt;
-            if (dt < 40 && __lastKeydownChar === e.data) return;   // physical kbd already sent it
+            if (li.__liveJustSent('T:' + e.data)) return;
             liveSend({ text: e.data });
         }
     };
